@@ -16,28 +16,63 @@ from model.template import template
 
 
 def chunk_fn(ctx_ids: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
-    """ Chunk tokens
+    """将 token 序列分块处理
+
+    用于长 context 的分块处理，避免单次处理过长的序列导致内存溢出。
+
+    Args:
+        ctx_ids: 输入的 token ID 张量，形状为 [batch_size, seq_len]
+        chunk_size: 每个分块的最大 token 数量
+
+    Returns:
+        List[torch.Tensor]: 分块后的 token ID 列表，每个元素形状为 [batch_size, chunk_size]
+
+    Example:
+        ctx_ids = [1, 2, 3, ..., 10000]  # 10000 tokens
+        chunks = chunk_fn(ctx_ids, chunk_size=2000)  # 返回 5 个分块
     """
     ctx_len = ctx_ids.shape[1]
+
+    # 如果序列长度超过分块大小，则进行分块
     if ctx_len > chunk_size:
-        chunk_num = (ctx_len - 1) // chunk_size + 1
+        chunk_num = (ctx_len - 1) // chunk_size + 1  # 计算需要的分块数量
         print(f"chunk inputs, size: {chunk_size} (num {chunk_num})")
 
         input_ids = []
         for i in range(chunk_num):
             start = i * chunk_size
             end = (i + 1) * chunk_size
+            # 截取当前分块范围的 tokens
             a_ids = ctx_ids[:, start:end]
-            if a_ids.shape[1] == 0:
+            if a_ids.shape[1] == 0:  # 跳过空分块
                 continue
             input_ids.append(a_ids)
     else:
+        # 序列长度不超过分块大小，直接返回原序列
         input_ids = [ctx_ids]
 
     return input_ids
 
 
 def load_head_score(model_name, ctx_len):
+    """从预存储文件加载 head-level importance scores
+
+    用于 context-independent 的 KV 压缩模式（--level head）。
+    预计算的 head scores 存储在 ./utils/head_score/ 目录下。
+
+    Args:
+        model_name: 模型名称，如 "Qwen2.5-7B-Instruct"
+        ctx_len: context 的 token 长度
+
+    Returns:
+        torch.Tensor: head-level importance scores，形状为 [1, 1, n_layers, n_heads, ctx_len]
+
+    Note:
+        - head-level score 表示每个 attention head 的整体重要性，与具体位置无关
+        - 分数会被扩展到所有 position，形成统一的 mask
+        - 支持的模型: Qwen2.5-7B/14B, Llama-3.1-8B
+    """
+    # 标准化模型名称以匹配存储路径
     if model_name.startswith("Qwen2.5-7B"):
         model_name = "qwen2.5-7b"
     elif model_name.startswith("Qwen2.5-14B"):
@@ -45,22 +80,61 @@ def load_head_score(model_name, ctx_len):
     elif model_name.startswith("Llama-3.1-8B"):
         model_name = "llama3.1-8b"
 
+    # 加载所有匹配的 head score 文件（可能来自多个数据集）
     attn_ = []
     paths = f"./utils/head_score/{model_name}-*.pt"
     for path in glob.glob(paths):
-        attn = torch.load(path).squeeze().cuda()  # layer x head
+        attn = torch.load(path).squeeze().cuda()  # 形状: [n_layers, n_heads]
         attn_.append(attn)
         print("Load head-score from", path)
 
-    attn = torch.stack(attn_, dim=0).amax(0)
-    score = attn.unsqueeze(-1).expand(-1, -1, ctx_len)  # layer x head x seq
-    score = score.unsqueeze(1)
+    # 取多个数据集 score 的最大值（保守策略：重要的 head 在任何任务中都重要）
+    attn = torch.stack(attn_, dim=0).amax(0)  # [n_layers, n_heads]
+
+    # 扩展到所有 position：每个 head 的 score 对所有 token position 都相同
+    score = attn.unsqueeze(-1).expand(-1, -1, ctx_len)  # [n_layers, n_heads, ctx_len]
+    score = score.unsqueeze(1)  # [1, 1, n_layers, n_heads, ctx_len]
     return score
 
 
 class ModelKVzip():
+    """KVzip 主类：封装模型加载、KV cache 管理、prefill、scoring 和生成功能
+
+    该类是 KVzip 的核心入口，提供完整的 KV cache 压缩推理流程：
+    1. 加载模型并 monkey patch attention 层
+    2. Prefill context 并填充 KV cache
+    3. 计算每个 KV pair 的 importance score
+    4. 根据压缩比例裁剪 KV cache
+    5. 使用裁剪后的 KV cache 进行推理
+
+    支持的模型: LLaMA3, Qwen2.5/3, Gemma3
+    支持的 KV 类型: evict（真实删除）、retain（标记保留）、int4static（量化）、hybrid_static（Gemma3）
+    """
 
     def __init__(self, model_name: str, kv_type: str = "evict"):
+        """初始化 ModelKVzip 实例
+
+        Args:
+            model_name: 模型名称，可以是简称（如 "qwen2.5-7b"）或完整 ID（如 "Qwen/Qwen2.5-7B-Instruct-1M"）
+            kv_type: KV cache 类型，可选值：
+                - "evict": 真正从内存删除被裁剪的 KV（节省内存）
+                - "retain": 只标记 mask，保留完整 KV（用于多压缩比评估）
+                - "int4static": INT4 量化 KV cache（QServe 量化模型）
+                - "hybrid_static": Gemma3 专用的 Hybrid cache
+                - "original": 不使用 KVzip，保持原始 cache
+
+        Attributes:
+            model: 加载的 HuggingFace 模型
+            tokenizer: 对应的 tokenizer
+            name: 模型简称
+            dtype: 模型数据类型（通常为 float16/bfloat16）
+            device: 模型设备（cuda）
+            config: 模型配置
+            kv_type: 实际使用的 KV cache 类型
+            gen_kwargs: 生成时的默认参数
+            sys_prompt_ids: 系统提示的 token IDs
+            postfix_ids: 响应后缀的 token IDs（如 "<|im_start|>assistant"）
+        """
         self.model, self.tokenizer = load_model(model_name)
 
         self.name = self.model.name
@@ -68,16 +142,21 @@ class ModelKVzip():
         self.device = self.model.device
         self.config = self.model.config
 
+        # 根据模型类型自动调整 KV cache 类型
         if isinstance(self.model, LlamaForCausalLMW8A8):
+            # QServe 量化模型，使用 INT4 static cache
             self.kv_type = "int4static"
             print("[Note] Currently, only retain cache is available for QServe")
         elif isinstance(self.model, Gemma3ForCausalLM):
+            # Gemma3 使用 Hybrid cache（交替的 sliding + static layers）
             self.kv_type = "hybrid_static"
             print("[Note] Currently, only retain cache is available for Gemma3")
         else:
+            # 其他模型使用用户指定的 KV 类型
             self.kv_type = kv_type
         print(f"KV type: {self.kv_type}")
 
+        # 设置生成参数：贪婪解码，最大 512 new tokens
         self.gen_kwargs = {
             "do_sample": False,
             "temperature": 1.0,
@@ -85,34 +164,88 @@ class ModelKVzip():
             "top_k": None,
             "max_new_tokens": 512,
         }
+
+        # Gemma3 和 Qwen3 需要特殊的生成参数
         if isinstance(self.model, Gemma3ForCausalLM):
             self.gen_kwargs["cache_implementation"] = None
             self.gen_kwargs["use_model_defaults"] = False
-            self.gen_kwargs["eos_token_id"] = [1, 106]
+            self.gen_kwargs["eos_token_id"] = [1, 106]  # Gemma3 的多个 EOS token
         elif isinstance(self.model, Qwen3ForCausalLM):
             self.gen_kwargs["cache_implementation"] = None
             self.gen_kwargs["use_model_defaults"] = False
-            self.gen_kwargs["eos_token_id"] = 151645
+            self.gen_kwargs["eos_token_id"] = 151645  # Qwen3 的 EOS token
 
+        # 设置 chat template（系统提示 + 响应后缀）
         self.set_chat_template()
 
     def encode(self, text: str) -> torch.Tensor:
-        """ Encode text into tokens
+        """将文本编码为 token IDs
+
+        Args:
+            text: 输入文本字符串
+
+        Returns:
+            torch.Tensor: token IDs，形状为 [1, seq_len]，已移到 CUDA 设备
+
+        Note:
+            不添加特殊 tokens（add_special_tokens=False），因为特殊 tokens 由 chat template 管理
         """
         return self.tokenizer.encode(text, add_special_tokens=False, return_tensors="pt").cuda()
 
     def decode(self, input_ids: torch.Tensor) -> str:
-        """ Decode tokens into text
+        """将 token IDs 解码为文本
+
+        Args:
+            input_ids: token IDs 张量，形状可以是 [seq_len] 或 [batch_size, seq_len]
+
+        Returns:
+            str: 解码后的文本字符串
         """
         if len(input_ids.shape) == 2:
-            input_ids = input_ids[0]
+            input_ids = input_ids[0]  # 取第一个 batch 的序列
         return self.tokenizer.decode(input_ids)
 
     def set_chat_template(self, task: str = "qa"):
+        """设置模型的 chat template（系统提示和响应后缀）
+
+        根据模型类型和任务类型，设置相应的对话格式模板。
+
+        Args:
+            task: 任务类型，影响系统提示的内容
+                - "qa": 问答任务，"Given the context, answer to the following question..."
+                - "gsm": 数学推理任务，包含额外的推理引导提示
+
+        Attributes 设置:
+            sys_prompt_ids: 系统提示部分的 token IDs（会保留在 KV cache 中不被裁剪）
+            postfix_ids: 响应后缀部分的 token IDs（如 "<|im_start|>assistant"）
+
+        Example:
+            LLaMA3 template:
+            - sys_prompt: "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n..."
+            - postfix: "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        """
         prefix, postfix = template(self.name, task)
         self.sys_prompt_ids, self.postfix_ids = self.encode(prefix), self.encode(postfix)
 
     def apply_template(self, query: str) -> torch.Tensor:
+        """将用户查询应用 chat template 格式
+
+        将查询文本转换为模型的输入格式，添加必要的格式标记。
+
+        Args:
+            query: 用户查询文本
+
+        Returns:
+            torch.Tensor: 格式化后的 token IDs，包含查询和响应后缀
+
+        Example:
+            query = "What is my name?"
+            返回: "\n\nWhat is my name?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+
+        Note:
+            - 查询前添加 "\n\n" 以与前面的 context 分隔
+            - 响应后缀由 set_chat_template 设置的 postfix_ids 提供
+        """
         query = f"\n\n{query.strip()}"
         query_ids = torch.cat([self.encode(query), self.postfix_ids], dim=1)
         return query_ids
@@ -126,29 +259,75 @@ class ModelKVzip():
         *args,
         **kwargs,
     ):
-        """ Compute Transformer forward pass
-            In default, we do not update the KV cache with the newly given inputs.
-            Set update_cache = True to enable the update.
-        """
-        seen_token_prev = kv._seen_tokens
+        """执行模型的 forward pass
 
+        这是模型推理的核心方法，用于：
+        1. Prefill 阶段填充 KV cache
+        2. Scoring 阶段计算 importance scores（不更新 cache）
+        3. 获取 logits 用于概率计算
+
+        Args:
+            input_ids: 输入 token IDs，形状为 [batch_size, seq_len]
+            kv: KV cache 实例（EvictCache 或 RetainCache）
+            update_cache: 是否将当前输入的 KV 写入 cache
+                - True: Prefill 时使用，填充 KV cache
+                - False: Scoring 时使用，只计算 attention，不写入 cache
+            return_logits: 是否返回输出 logits
+                - True: 用于概率计算（_prob 方法）
+                - False: 只执行 forward，不返回结果（节省内存）
+            *args, **kwargs: 传递给模型的其他参数
+
+        Returns:
+            模型输出（如果 return_logits=True）或 None
+
+        Note:
+            - 当 update_cache=False 时，会使用 kv.slice() 撤销对 cache 的任何修改
+            - 这样可以在 scoring 时复用同一份 KV cache，而不污染原始 cache
+        """
+        seen_token_prev = kv._seen_tokens  # 记录当前 cache 的 token 数量
+
+        # Gemma3 的 Hybrid cache 需要特殊处理：备份 sliding window 部分
         if isinstance(kv, RetainHybridCache) and not update_cache:
             kv.backup_sliding_cache()
 
         if return_logits:
+            # 执行完整 forward，返回 logits（用于概率计算）
             outputs = self.model(input_ids, past_key_values=kv, *args, **kwargs)
         else:
+            # 只执行 decoder forward，不计算 logits（节省计算）
             _ = self.model.model(input_ids, past_key_values=kv, *args, **kwargs)
             outputs = None
 
         if not update_cache:
+            # 撤销对 cache 的修改：删除本次 forward 产生的 KV
+            # 这样可以在多次 scoring 中复用同一份 prefill 的 KV cache
             kv.slice(seen_token_prev)
+
         return outputs
 
     def _init_kv(self, kv=None, evict_range=(0, 0)):
-        """ Initialize KV cache
-        """
+        """初始化 KV cache 实例
 
+        根据模型和配置创建合适的 KV cache 类型。
+
+        Args:
+            kv: 如果提供，直接返回该 kv；如果为 None，则创建新的 cache
+            evict_range: 可被裁剪的 token 范围 (start, end)
+                - start: 系统提示结束位置（这些 KV 不参与裁剪，作为 sink 保留）
+                - end: context 结束位置
+
+        Returns:
+            KV cache 实例，类型取决于 kv_type:
+                - "retain": RetainCache（保留完整 KV，标记 mask）
+                - "evict": EvictCache（真实删除 KV）
+                - "int4static": OptimINT4KVCache（INT4 量化 cache）
+                - "hybrid_static": RetainHybridCache（Gemma3 Hybrid cache）
+                - "original": DynamicCache（原始 HuggingFace cache）
+
+        Note:
+            evict_range 的设计确保系统提示（如 "You are a helpful assistant"）的 KV
+            不会被裁剪，因为它们对所有后续查询都很重要。
+        """
         if kv is None:
             if self.kv_type == "retain":
                 kv = RetainCache(self.model, evict_range)
@@ -157,10 +336,11 @@ class ModelKVzip():
             elif self.kv_type == "int4static":
                 kv = OptimINT4KVCache(self.model.model, evict_range)
             elif self.kv_type == "hybrid_static":
-                max_size = 190000
+                max_size = 190000  # Gemma3 的最大 cache 长度
                 kv = RetainHybridCache(self.model.model, evict_range, max_size)
             elif self.kv_type == "original":
                 kv = DynamicCache()
+                # 标记属性，兼容 KVzip 的检查逻辑
                 kv.pruned, kv.get_score = False, False
             else:
                 raise NotImplementedError(f"type {self.kv_type} is not implemented")
@@ -174,24 +354,69 @@ class ModelKVzip():
         load_score=False,
         do_score=True,
     ) -> Union[RetainCache, EvictCache]:
-        """ Chunked prefill KV cache
+        """分块预填充 KV cache 并计算 importance scores
+
+        这是 KVzip 的核心方法之一，完成两个关键任务：
+        1. 将 context tokens 分块处理，填充到 KV cache
+        2. 计算每个 KV pair 的 importance score（用于后续裁剪）
+
+        Args:
+            ctx_ids: Context 内容，可以是字符串或已编码的 token IDs
+            prefill_chunk_size: Prefill 时的分块大小（默认 16000 tokens）
+                - 长 context 需要分块处理以避免内存溢出
+                - 每个分块独立进行 forward pass
+            load_score: 是否从预存储文件加载 head-level scores
+                - True: 使用预计算的 head-level scores（context-independent 模式）
+                - False: 在当前 context 上实时计算 scores（context-dependent 模式）
+            do_score: 是否执行 importance scoring
+                - True: 完成预填充后立即计算 scores
+                - False: 只预填充，不计算 scores（用于快速测试）
+
+        Returns:
+            Union[RetainCache, EvictCache]: 填充好的 KV cache 实例
+                - 包含 context 的所有 KV pairs
+                - 包含每个 KV position 的 importance score
+
+        流程详解:
+            1. 编码 context（如果是字符串）
+            2. 添加系统提示，构建完整的 prefill_ids
+            3. 初始化 KV cache，设置 evict_range（系统提示不参与裁剪）
+            4. 分块执行 forward，填充 KV cache
+            5. 执行 importance scoring（如果 do_score=True）
+
+        Example:
+            context = "My name is Kim. I live in Seoul."
+            kv = model.prefill(context)
+            # kv 包含:
+            #   - key_cache[layer]: 所有 key vectors
+            #   - value_cache[layer]: 所有 value vectors
+            #   - score[layer][head][position]: 每个 KV 的 importance
         """
+        # 如果输入是字符串，先编码为 token IDs
         if type(ctx_ids) == str:
             ctx_ids = self.encode(ctx_ids)
+
+        # 构建完整的预填充输入：系统提示 + context
         prefill_ids = torch.cat([self.sys_prompt_ids, ctx_ids], dim=1)
+
+        # 设置裁剪范围：系统提示部分不参与裁剪（作为 sink 保留）
+        # evict_range = (sys_prompt_len, total_len)
         evict_range = (self.sys_prompt_ids.shape[1], prefill_ids.shape[1])
 
-        kv = self._init_kv(evict_range=evict_range)  # do not evict system prompt KV
-        kv.ctx_ids = ctx_ids
-        kv.prefill_ids = prefill_ids
+        # 初始化 KV cache
+        kv = self._init_kv(evict_range=evict_range)
+        kv.ctx_ids = ctx_ids  # 保存原始 context（用于 scoring）
+        kv.prefill_ids = prefill_ids  # 保存完整预填充 IDs（用于 generate）
 
-        # prefill
+        # 分块预填充：避免长 context 导致内存溢出
         for input_ids in tqdm(chunk_fn(prefill_ids, prefill_chunk_size), desc="Prefill"):
-            self.__call__(input_ids, kv, update_cache=True)
+            self.__call__(input_ids, kv, update_cache=True)  # 填充 KV cache
 
         if do_score:
-            # KV importance scoring
+            # 计算 KV importance scores
+            # 使用 context reconstruction 任务：让模型 "repeat" context 各部分
             self.scoring(kv, ctx_ids, load_score=load_score)
+
         return kv
 
     def self_task(
@@ -199,24 +424,78 @@ class ModelKVzip():
         ctx_ids: torch.Tensor,
         chunk_size: int = 2000,
         prev_postfix_size=8,
-    ) -> List[torch.Tensor]:
-        """ Prepare chunked inputs for KV importance scoring with context reconstruction
-            return: List[torch.Tensor]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """构建 Context Reconstruction 任务的分块输入
+
+        这是 KVzip importance scoring 的核心设计：通过让模型"复述" context 的各个部分，
+        来观察模型在生成时 attend 到了哪些 KV pairs，从而确定每个 KV 的重要性。
+
+        Args:
+            ctx_ids: Context 的 token IDs，形状为 [batch_size, ctx_len]
+            chunk_size: Scoring 时的分块大小（默认 2000 tokens）
+                - 每个 chunk 独立执行一次 "repeat" forward pass
+                - 较小的 chunk_size 可以更精细地计算 importance
+            prev_postfix_size: 前一块末尾保留的 token 数量（默认 8）
+                - 用于给模型提供"锚点"，帮助定位复述的起始位置
+
+        Returns:
+            List[Tuple[torch.Tensor, torch.Tensor]]: 每个分块的任务输入
+                每个元素是 (prefill_ids_p, repeat_ids_p):
+                - prefill_ids_p: 当前 chunk 的内容（用于确定 score 记录范围）
+                - repeat_ids_p: 完整的 repeat 输入（query + postfix + chunk 内容）
+
+        设计原理:
+            ┌─────────────────────────────────────────────────────────────────┐
+            │ Chunk 0: tokens[0:2000]                                         │
+            │ Query: "Repeat the previous context exactly."                   │
+            │ 模型生成 chunk0 内容时，会 attend 到 chunk0 的 KV               │
+            │ 记录 positions [0:2000] 的 attention weights 作为 importance    │
+            ├─────────────────────────────────────────────────────────────────┤
+            │ Chunk 1: tokens[2000:4000]                                      │
+            │ Query: "Repeat ... starting with [chunk0末尾8 tokens]"          │
+            │ 模型生成 chunk1 内容时，会 attend 到 chunk1 的 KV               │
+            │ 记录 positions [2000:4000] 的 attention weights                 │
+            └─────────────────────────────────────────────────────────────────┘
+
+        为什么后续 chunk 要加前一块末尾 8 tokens?
+            - 提供连续性"锚点"，让模型知道从哪里开始复述
+            - 这 8 tokens 作为 query的一部分，模型会自然 attend 到它们之后的 KV
+            - 避免 chunk 之间的"断裂"导致 attention 分布不准确
+
+        Example:
+            context = "Hello world. This is a test..."  # 8000 tokens
+            tasks = model.self_task(ctx_ids, chunk_size=2000)
+            # 返回 4 个分块任务:
+            # tasks[0] = (chunk0_ids, "Repeat the previous context exactly." + postfix + chunk0)
+            # tasks[1] = (chunk1_ids, "Repeat ... starting with [chunk0末尾]" + postfix + chunk1)
+            # ...
         """
+        # 将 context 分块
         chunked_inputs = chunk_fn(ctx_ids, chunk_size)
 
         input_ids = []
         for i, a_ids in enumerate(chunked_inputs):
+            # 构建每个 chunk 的 query
             if i == 0:
+                # 第一个 chunk: 直接要求复述整个 context
                 prompt = f"\n\nRepeat the previous context exactly."
                 q_ids = self.encode(prompt)
             else:
+                # 后续 chunk: 给出前一块末尾作为"锚点"
                 prompt = f"\n\nRepeat the part of the previous context exactly, starting with "
                 q_ids = self.encode(prompt)
+                # 取前一块的末尾 tokens 作为提示
                 postfix_prev = chunked_inputs[i - 1][:, -prev_postfix_size:]
                 q_ids = torch.cat([q_ids, postfix_prev], dim=1)
 
-            input_ids.append((a_ids, torch.cat([q_ids, self.postfix_ids, a_ids], dim=1)))
+            # 构建完整的 repeat 输入
+            # (chunk内容, query + postfix + chunk内容)
+            # chunk内容用于确定 scoring 的 start_idx 和 end_idx
+            # repeat_ids_p 用于实际 forward pass
+            input_ids.append((
+                a_ids,  # 当前 chunk 的内容
+                torch.cat([q_ids, self.postfix_ids, a_ids], dim=1)  # 完整 repeat 输入
+            ))
 
         return input_ids
 
@@ -227,25 +506,93 @@ class ModelKVzip():
         ctx_ids: torch.Tensor,
         load_score=False,
     ):
-        """ KV importance scoring (update kv.score)
+        """计算 KV cache 的重要性分数
+
+        通过 Context Reconstruction 任务计算每个 KV pair 的 importance score。
+        核心思想：让模型尝试复述 context 各部分，通过观察 attention weights 确定重要性。
+
+        Args:
+            kv: KV cache 实例（已完成 prefill）
+            ctx_ids: Context 的 token IDs
+            load_score: 是否加载预计算的 head-level scores
+                - True: context-independent 模式，使用预存储的 scores
+                - False: context-dependent 模式，在当前 context 上实时计算
+
+        实现流程（context-dependent 模式）:
+            1. 初始化 score 存储结构 kv.score[layer][head][position] = 0
+            2. 构建分块的 self_task（每个 chunk 一个 repeat 任务）
+            3. 对每个 chunk:
+               a. 设置 scoring 范围: start_idx ~ end_idx
+               b. 执行 forward pass（在 attention 层触发 _get_score）
+               c. _get_score 计算 query 对当前 chunk KV 的 attention weights
+               d. 取 max 作为 importance score
+            4. 最终 kv.score 包含每个 position 的分数
+
+        Scoring 范围控制（关键机制）:
+            ┌─────────────────────────────────────────────────────────────────┐
+            │ KV Cache 结构:                                                  │
+            │ [sink(系统提示) | chunk0_kv | chunk1_kv | chunk2_kv | ...]      │
+            │                                                                 │
+            │ Scoring chunk 1 时:                                            │
+            │ start_idx = 2000, end_idx = 4000                               │
+            │ _get_score 只计算 chunk1_kv 范围内的 attention weights         │
+            │ 其他 chunks 的 KV 被忽略（不参与 attention 计算）               │
+            └─────────────────────────────────────────────────────────────────┘
+
+        为什么这样设计?
+            - 每个 chunk 独立 scoring，确保每个 position 都有机会作为 query 被 attend
+            - 只关注当前 chunk 的 KV，避免 attention 被 long context 稀释
+            - 分块处理提高效率，避免一次处理超长序列
+
+        context-independent 模式（load_score=True）:
+            - 使用预计算的 head-level importance scores
+            - 无需 runtime scoring overhead
+            - 分数来自多个数据集的 max，保证泛化性
+            - 存储路径: ./utils/head_score/{model_name}-*.pt
+
+        输出:
+            kv.score 更新为 [n_layers][n_heads][ctx_len] 的 importance 分数
+            kv.get_score 设为 False（完成 scoring 标记）
         """
         if not load_score:
-            kv.init_score()
-            start_idx_tmp = kv.start_idx
+            # Context-dependent 模式：在当前 context 上实时计算 scores
 
-            kv.end_idx = 0
-            input_ids = self.self_task(ctx_ids)
-            for i, (prefill_ids_p,
-                    repeat_ids_p) in enumerate(tqdm(input_ids, desc=f"Importance scoring")):
-                kv.end_idx = kv.start_idx + prefill_ids_p.shape[1]  # indices for a chunk
-                self.__call__(repeat_ids_p, kv, update_cache=False)  # get score
+            # Step 1: 初始化 score 存储结构
+            kv.init_score()  # 创建 score[layer] = zeros([1, n_heads_kv, ctx_len])
+
+            # Step 2: 保存原始 start_idx（scoring 后会恢复）
+            start_idx_tmp = kv.start_idx  # 通常是系统提示长度（如 50）
+
+            # Step 3: 构建分块的 repeat 任务
+            kv.end_idx = 0  # 初始化 end_idx
+            input_ids = self.self_task(ctx_ids)  # 返回 List[(chunk_ids, repeat_ids)]
+
+            # Step 4: 对每个 chunk 执行 forward，计算 score
+            for i, (prefill_ids_p, repeat_ids_p) in enumerate(
+                tqdm(input_ids, desc=f"Importance scoring")
+            ):
+                # 设置当前 chunk 的 scoring 范围
+                kv.end_idx = kv.start_idx + prefill_ids_p.shape[1]
+                # 例如 chunk1: start_idx=2000, end_idx=4000
+
+                # 执行 forward pass
+                # 在 attention forward 中，如果 kv.get_score=True，会调用 _get_score()
+                # _get_score() 计算 query 对 [start_idx:end_idx] 范围 KV 的 attention weights
+                self.__call__(repeat_ids_p, kv, update_cache=False)  # 不更新 cache
+
+                # 移动到下一个 chunk
                 kv.start_idx = kv.end_idx
 
+            # Step 5: 恢复原始 start_idx
             kv.start_idx = start_idx_tmp
+
+            # Step 6: 验证 score 维度正确
             assert kv.score[0].shape[-1] == kv.ctx_len
         else:
+            # Context-independent 模式：加载预计算的 head-level scores
             kv.score = load_head_score(self.name, kv.ctx_len)
 
+        # 完成 scoring，关闭 get_score 标记
         kv.get_score = False
 
     @torch.inference_mode()
@@ -255,52 +602,154 @@ class ModelKVzip():
         kv: Optional[Union[RetainCache, EvictCache]] = None,
         update_cache: bool = False,
     ) -> str:
-        """ Obtain a model response to the query
-            In default, we evict KV of query and generated answer after the generation by kv.slice (for multi-query evaluation).
-            Set update_cache = True to enable multi-turn generation.
-        """
-        kv = self._init_kv(kv=kv)
-        seen_token_prev = kv._seen_tokens
+        """使用 KV cache 生成模型响应
 
+        在预填充的 context KV cache 上，生成对用户查询的回答。
+        支持 KV cache 的裁剪（pruned）和完整（full）两种模式。
+
+        Args:
+            query: 用户查询，可以是字符串或已编码的 token IDs
+            kv: KV cache 实例（通常来自 prefill）
+                - 如果为 None，会创建新的空 cache（不推荐，会丢失 context）
+                - 如果是已裁剪的 cache（kv.pruned=True），使用压缩后的 KV 推理
+            update_cache: 是否在生成后保留 query 和回答的 KV
+                - False: 生成后删除 query 和回答的 KV（默认，支持多查询评估）
+                - True: 保留所有 KV，支持多轮对话（multi-turn）
+
+        Returns:
+            str: 模型生成的回答文本（不包含 query）
+
+        生成流程:
+            1. 初始化/验证 KV cache
+            2. 构建完整输入（prefill_ids + query_ids）
+            3. 调用 model.generate() 进行自回归生成
+            4. 解码生成的 token IDs
+            5. 根据 update_cache 决定是否清理 cache
+
+        KV Cache 状态管理:
+            ┌─────────────────────────────────────────────────────────────────┐
+            │ update_cache=False (默认):                                     │
+            │   生成前: cache = [sys_prompt | context_kv]                    │
+            │   生成中: cache += [query_kv | answer_kv]                      │
+            │   生成后: cache = [sys_prompt | context_kv] (slice 撤销修改)    │
+            │   → 支持对同一 context 进行多个 query 的评估                    │
+            ├─────────────────────────────────────────────────────────────────┤
+            │ update_cache=True (多轮对话):                                  │
+            │   生成前: cache = [sys_prompt | context_kv | prev_qa_kv]       │
+            │   生成后: cache = [sys_prompt | context_kv | prev_qa_kv |      │
+            │                    new_query_kv | new_answer_kv]               │
+            │   → 支持连续对话，保留完整历史                                  │
+            └─────────────────────────────────────────────────────────────────┘
+
+        HuggingFace generate 的特殊处理:
+            - model.generate() 需要完整的 input_ids（包含已 cache 的部分）
+            - 内部会自动切片，只处理新 tokens（input_ids[:, -kv.get_seq_length():]）
+            - 这是为了兼容 HuggingFace 的 cache 机制
+
+        Example:
+            kv = model.prefill(context)
+            kv.prune(ratio=0.3)  # 裁剪 70% KV
+
+            # 第一个 query
+            answer1 = model.generate("What is my name?", kv)
+            # cache 状态保持 [sys_prompt | context_kv(30%)]
+
+            # 第二个 query（复用同一份裁剪后的 cache）
+            answer2 = model.generate("Where do I live?", kv)
+        """
+        # 初始化 KV cache（如果 kv 为 None，创建空 cache）
+        kv = self._init_kv(kv=kv)
+        seen_token_prev = kv._seen_tokens  # 记录当前 cache 的 token 数量
+
+        # Gemma3 的 Hybrid cache 需要特殊处理
         if isinstance(kv, RetainHybridCache) and not update_cache:
             kv.backup_sliding_cache()
 
+        # 准备输入
         input_ids = query
         if type(query) == str:
             input_ids = self.encode(query)
+
+        # HuggingFace 的 model.generate 需要完整输入（包含已 cache 的部分）
+        # 内部会自动切片，只处理新 tokens
         if kv.prefill_ids is not None:
-            # Huggingface Transformers model.generate requires full input tokens when using KV caches.
-            # The inputs will be spliced to only contain new tokens as input[:, -kv.get_seq_length():].
             input_ids = torch.cat([kv.prefill_ids, input_ids], dim=1)
 
+        # 执行自回归生成
         output = self.model.generate(input_ids, past_key_values=kv, **self.gen_kwargs)
-        a_ids = output[:, len(input_ids[0]):-1]  # parse response
+
+        # 解析生成的回答（去掉输入部分和最后的 EOS token）
+        a_ids = output[:, len(input_ids[0]):-1]
         a = self.decode(a_ids)
 
+        # Cache 状态管理
         if not update_cache:
+            # 删除本次 query 和 answer 的 KV，恢复到 prefill 状态
+            # 支持对同一 context 进行多个 query 的评估
             kv.slice(seen_token_prev)
         else:
+            # 保留本次 query 和 answer 的 KV，更新 prefill_ids
+            # 支持多轮对话
             kv.prefill_ids = torch.cat([input_ids, a_ids], dim=1)
+
         return a
 
     @torch.inference_mode()
     def _prob(self, input_ids, kv=None, device="cuda") -> torch.Tensor:
-        """ Obtain next token prediction probabilities
+        """获取下一个 token 的预测概率分布
+
+        用于评估模型在给定 query-answer 对时的预测概率。
+        主要用于计算 perplexity、准确率等评估指标。
+
+        Args:
+            input_ids: 输入 token IDs（query + answer）
+            kv: KV cache 实例（可选）
+            device: 输出设备，"cuda" 或 "cpu"
+
+        Returns:
+            torch.Tensor: 每个位置的 next token 概率分布
+                形状为 [seq_len, vocab_size]
+                softmax 已应用，值域 [0, 1]
+
+        使用场景:
+            - 评估模型在裁剪 KV cache 后的预测能力
+            - 计算生成的 perplexity
+            - 分析模型对特定 token 的置信度
+
+        Example:
+            # 计算 answer 的概率
+            kv = model.prefill(context)
+            kv.prune(ratio=0.3)
+
+            query_ids = model.apply_template("What is my name?")
+            answer_ids = model.encode("Kim")
+            input_ids = torch.cat([query_ids, answer_ids], dim=1)
+
+            prob = model._prob(input_ids, kv)
+            # prob[-1] 是 "Kim" 第一个 token 的预测概率
         """
         kv = self._init_kv(kv=kv)
 
+        # 获取 logits
         if isinstance(self.model, LlamaForCausalLMW8A8):
-            output = self.__call__(input_ids,
-                                   kv,
-                                   update_cache=False,
-                                   return_logits=True,
-                                   is_prompt=False)
+            # QServe 量化模型有特殊的输出格式
+            output = self.__call__(
+                input_ids,
+                kv,
+                update_cache=False,
+                return_logits=True,
+                is_prompt=False
+            )
             output = output[0]
         else:
+            # 标准模型的 logits 输出
             output = self.__call__(input_ids, kv, update_cache=False, return_logits=True)
             output = output.logits[0]
+
+        # 应用 softmax 得到概率分布
         output = inplace_softmax(output).squeeze()
 
+        # 根据需要移动到指定设备
         if device == "cpu":
             return output.cpu()
         return output
