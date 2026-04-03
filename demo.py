@@ -7,7 +7,7 @@ parser.add_argument("-m", "--mode", default="kvzip", choices=["kvzip", "kvzip_he
 args = parser.parse_args()
 
 stamp = TimeStamp(verbose=True, unit="ms")  # time and memory profiling
-model = ModelKVzip("Qwen/Qwen2.5-7B-Instruct-1M")
+model = ModelKVzip("Qwen/Qwen2.5-VL-3B-Instruct")
 
 if args.mode == "no":
     with open('./data/repo_readme.txt', 'r') as file:

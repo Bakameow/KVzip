@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
 
 
 def get_model_id(name: str):
@@ -115,13 +115,23 @@ def load_model(model_name: str, **kwargs):
             }
             config.max_position_embeddings = 131072
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype="auto",
-            device_map="auto",
-            attn_implementation='flash_attention_2',
-            config=config,
-        )
+        # VL models require AutoModelForVision2Seq, not AutoModelForCausalLM
+        if is_vlm:
+            model = AutoModelForVision2Seq.from_pretrained(
+                model_id,
+                torch_dtype="auto",
+                device_map="auto",
+                attn_implementation='flash_attention_2',
+                config=config,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype="auto",
+                device_map="auto",
+                attn_implementation='flash_attention_2',
+                config=config,
+            )
         tokenizer = AutoTokenizer.from_pretrained(model_id)
 
         if "llama" in model_id.lower():
