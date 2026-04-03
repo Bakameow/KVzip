@@ -10,10 +10,12 @@ def template(model_name, task):
 
     elif model_name.startswith("qwen"):
         # https://github.com/QwenLM/Qwen3
+        # Works for Qwen2.5, Qwen3, Qwen2-VL, Qwen2.5-VL, Qwen3-VL
         prefix = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         prefix += "<|im_start|>user\n"
 
         postfix = "<|im_end|>\n<|im_start|>assistant\n"
+        # Note: Qwen3 text-only models use thinking mode, but we skip it here for simplicity
         if "qwen3-" in model_name:
             postfix += "<think>\n\n</think>\n\n"
 
@@ -24,7 +26,7 @@ def template(model_name, task):
         postfix = "<end_of_turn>\n<start_of_turn>model\n"
 
     else:
-        print("**Warning** The model template does not exist! Check data/template.py")
+        print("**Warning** The model template does not exist! Check model/template.py")
         prefix = "<|begin_of_text|>"
         postfix = "\n\nAnswer: "
 
@@ -37,4 +39,4 @@ def template(model_name, task):
 
 
 if __name__ == "__main__":
-    print(template("Who are you?"))
+    print(template("qwen2.5-vl-7b", "qa"))

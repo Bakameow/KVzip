@@ -107,7 +107,7 @@ class ModelKVzip():
     4. 根据压缩比例裁剪 KV cache
     5. 使用裁剪后的 KV cache 进行推理
 
-    支持的模型: LLaMA3, Qwen2.5/3, Gemma3
+    支持的模型: LLaMA3, Qwen2.5/3, Gemma3, Qwen2-VL, Qwen2.5-VL
     支持的 KV 类型: evict（真实删除）、retain（标记保留）、int4static（量化）、hybrid_static（Gemma3）
     """
 
@@ -131,6 +131,8 @@ class ModelKVzip():
             device: 模型设备（cuda）
             config: 模型配置
             kv_type: 实际使用的 KV cache 类型
+            is_vlm: 是否为视觉语言模型
+            multimodal_token_ids: 多模态特殊 token 的 ID 映射
             gen_kwargs: 生成时的默认参数
             sys_prompt_ids: 系统提示的 token IDs
             postfix_ids: 响应后缀的 token IDs（如 "<|im_start|>assistant"）
@@ -141,6 +143,10 @@ class ModelKVzip():
         self.dtype = self.model.dtype
         self.device = self.model.device
         self.config = self.model.config
+
+        # Check if this is a VLM model
+        self.is_vlm = getattr(self.model, 'is_vlm', False)
+        self.multimodal_token_ids = getattr(self.model, 'multimodal_token_ids', {})
 
         # 根据模型类型自动调整 KV cache 类型
         if isinstance(self.model, LlamaForCausalLMW8A8):
@@ -155,6 +161,9 @@ class ModelKVzip():
             # 其他模型使用用户指定的 KV 类型
             self.kv_type = kv_type
         print(f"KV type: {self.kv_type}")
+
+        if self.is_vlm:
+            print(f"[VLM] Multimodal tokens will be preserved during KV pruning")
 
         # 设置生成参数：贪婪解码，最大 512 new tokens
         self.gen_kwargs = {
@@ -177,6 +186,73 @@ class ModelKVzip():
 
         # 设置 chat template（系统提示 + 响应后缀）
         self.set_chat_template()
+
+    def detect_multimodal_positions(self, token_ids: torch.Tensor) -> List[Tuple[int, int]]:
+        """检测多模态 token（如图像/视频 token）的位置范围。
+
+        对于 VLM 模型，多模态内容（图像/视频）会被编码为特殊的 token 序列，
+        这些 token 不应该参与 KV cache 的 scoring 和 pruning。
+
+        Args:
+            token_ids: Token ID 张量，形状为 [batch_size, seq_len]
+
+        Returns:
+            List[Tuple[int, int]]: 多模态 token 的位置范围列表
+                每个元素为 (start_pos, end_pos)，表示一个连续的多模态 token 区块
+
+        Example:
+            # Qwen-VL 的图像 token 结构:
+            # <|vision_start|> ... image tokens ... <|vision_end|>
+            # 返回: [(10, 500)] 表示 position 10-500 是图像 token
+        """
+        if not self.is_vlm or not self.multimodal_token_ids:
+            return []
+
+        ranges = []
+        token_ids_flat = token_ids[0].cpu().tolist()
+
+        # Get vision-related token IDs
+        vision_start_id = self.multimodal_token_ids.get('vision_start')
+        vision_end_id = self.multimodal_token_ids.get('vision_end')
+        image_pad_id = self.multimodal_token_ids.get('image_pad')
+        video_pad_id = self.multimodal_token_ids.get('video_pad')
+
+        # Find multimodal token ranges
+        i = 0
+        while i < len(token_ids_flat):
+            # Check for vision_start marker (Qwen-VL format)
+            if vision_start_id and token_ids_flat[i] == vision_start_id:
+                start_pos = i
+                # Find the matching vision_end
+                for j in range(i + 1, len(token_ids_flat)):
+                    if vision_end_id and token_ids_flat[j] == vision_end_id:
+                        ranges.append((start_pos, j + 1))  # Include vision_end
+                        i = j + 1
+                        break
+                continue
+
+            # Check for continuous image_pad tokens (alternative format)
+            if image_pad_id and token_ids_flat[i] == image_pad_id:
+                start_pos = i
+                while i < len(token_ids_flat) and token_ids_flat[i] == image_pad_id:
+                    i += 1
+                ranges.append((start_pos, i))
+                continue
+
+            # Check for continuous video_pad tokens
+            if video_pad_id and token_ids_flat[i] == video_pad_id:
+                start_pos = i
+                while i < len(token_ids_flat) and token_ids_flat[i] == video_pad_id:
+                    i += 1
+                ranges.append((start_pos, i))
+                continue
+
+            i += 1
+
+        if ranges:
+            print(f"[VLM] Detected {len(ranges)} multimodal token ranges: {ranges}")
+
+        return ranges
 
     def encode(self, text: str) -> torch.Tensor:
         """将文本编码为 token IDs
@@ -408,6 +484,14 @@ class ModelKVzip():
         kv.ctx_ids = ctx_ids  # 保存原始 context（用于 scoring）
         kv.prefill_ids = prefill_ids  # 保存完整预填充 IDs（用于 generate）
 
+        # VLM: 检测多模态 token 位置并设置到 KV cache
+        if self.is_vlm:
+            # 检测 context 中的多模态 token 范围
+            multimodal_ranges = self.detect_multimodal_positions(ctx_ids)
+            if multimodal_ranges:
+                # 设置到 KV cache，这些位置的 token 将不会被 scoring/pruning
+                kv.set_multimodal_ranges(multimodal_ranges)
+
         # 分块预填充：避免长 context 导致内存溢出
         for input_ids in tqdm(chunk_fn(prefill_ids, prefill_chunk_size), desc="Prefill"):
             self.__call__(input_ids, kv, update_cache=True)  # 填充 KV cache
@@ -415,6 +499,7 @@ class ModelKVzip():
         if do_score:
             # 计算 KV importance scores
             # 使用 context reconstruction 任务：让模型 "repeat" context 各部分
+            # 注意：多模态 token 会被跳过 scoring，自动分配 inf score
             self.scoring(kv, ctx_ids, load_score=load_score)
 
         return kv

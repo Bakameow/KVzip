@@ -96,6 +96,105 @@ def llama_qwen_attn_forward(
     return attn_output, attn_weights
 
 
+def qwen_vl_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    """Attention forward for Qwen-VL models with multimodal token support.
+
+    Qwen-VL uses multimodal rotary position embeddings (mrope) which include
+    temporal/spatial position information for vision tokens.
+
+    Args:
+        hidden_states: Input hidden states
+        position_embeddings: Tuple of (cos, sin, mrope_section) for multimodal RoPE
+        attention_mask: Attention mask
+        past_key_value: KV cache
+        cache_position: Position indices for cache
+
+    Note:
+        Multimodal tokens (image/video) are marked in the KV cache and will
+        NOT be scored or pruned during KV compression.
+    """
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+
+    bsz, q_len, _ = hidden_states.size()
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    # Apply multimodal rotary position embeddings
+    cos, sin, mrope_section = position_embeddings
+    query_states, key_states = apply_multimodal_rotary_pos_emb(
+        query_states, key_states, cos, sin, mrope_section
+    )
+
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_value.update(
+            key_states, value_states, self.layer_idx, cache_kwargs
+        )
+
+    dropout_rate = self.attention_dropout if self.training else 0.0
+
+    #### Updated for VLM multimodal support #################################
+    if getattr(past_key_value, "get_score", None):
+        # Calculate KV importance, multimodal tokens will be handled separately
+        past_key_value._get_score(query_states, key_states, self.layer_idx)
+
+    if getattr(past_key_value, "pruned", None):
+        # Attention with pruned cache (multimodal tokens are always retained)
+        query_states, key_states, value_states, info = past_key_value.prepare(
+            query_states, key_states, value_states, self.layer_idx
+        )
+
+        attn_output = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=info["cu_len_q"],
+            cu_seqlens_k=info["cu_len_k"],
+            max_seqlen_q=info["max_len_q"],
+            max_seqlen_k=info["max_len_k"],
+            dropout_p=dropout_rate,
+            causal=True,
+        )
+        attn_output = attn_output.view(
+            bsz, self.config.num_key_value_heads, q_len,
+            self.num_key_value_groups, self.head_dim
+        ).transpose(1, 2)
+    else:
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        attn_output = _flash_attention_forward(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            q_len,
+            dropout=dropout_rate,
+            sliding_window=getattr(self, "sliding_window", None),
+            is_causal=self.is_causal,
+        )
+    ###################################################################
+
+    attn_output = attn_output.contiguous().view(bsz, q_len, -1)
+    attn_output = self.o_proj(attn_output)
+
+    attn_weights = None
+    return attn_output, attn_weights
+
+
 def gemma3_attn_forward(
     self,
     hidden_states: torch.Tensor,

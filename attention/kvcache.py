@@ -17,6 +17,7 @@ class EvictCache(DynamicCache, KVScore):
 
     def __init__(self, model, evict_range: Tuple[int, int]):
         DynamicCache.__init__(self)
+        KVScore.__init__(self)  # Initialize KVScore for multimodal support
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         self.n_layers = model.config.num_hidden_layers
@@ -221,6 +222,7 @@ class RetainCache(DynamicCache, KVScore):
 
     def __init__(self, model, evict_range: Tuple[int, int]):
         DynamicCache.__init__(self)
+        KVScore.__init__(self)  # Initialize KVScore for multimodal support
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         self.n_layers = model.config.num_hidden_layers
@@ -362,6 +364,7 @@ class RetainHybridCache(HybridCache, HybridKVScore):
                              max_cache_len=max_cache_len,
                              device=self.device,
                              dtype=self.dtype)
+        HybridKVScore.__init__(self)  # Initialize HybridKVScore for multimodal support
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         self.n_layers = config.num_hidden_layers
