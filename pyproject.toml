@@ -20,13 +20,17 @@ dependencies = [
     "rouge",
     "tree-sitter==0.21.3",
     "tree-sitter-languages==1.10.2",
-    "pandas==2.0.3",
+    "pandas==2.2.0",
     "numpy==1.26.4",
     "scipy==1.14.1",
     "scikit-learn==1.5.2",
     "future==1.0.0",
     "decorator==5.1.1",
+    "flash_attn"
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.3cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
