@@ -1,3 +1,11 @@
+import os
+
+# 强制离线模式：不从网络下载，只使用本地缓存
+# 必须在导入 transformers 之前设置
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
 
@@ -23,14 +31,14 @@ def get_model_id(name: str):
         assert size in ["1", "3"], "Model is not supported!"
         return f"meta-llama/Llama-3.2-{size}B-Instruct"
 
+    elif name.startswith("qwen2.5-vl-"):
+        # Qwen2.5-VL vision-language models (must come before qwen2.5-)
+        assert size in ["3", "7", "72"], "Model is not supported!"
+        return f"Qwen/Qwen2.5-VL-{size}B-Instruct"
+
     elif name.startswith("qwen2.5-"):
         assert size in ["7", "14"], "Model is not supported!"
         return f"Qwen/Qwen2.5-{size}B-Instruct-1M"
-
-    elif name.startswith("qwen2.5-vl-"):
-        # Qwen2.5-VL vision-language models
-        assert size in ["3", "7", "72"], "Model is not supported!"
-        return f"Qwen/Qwen2.5-VL-{size}B-Instruct"
 
     elif name.startswith("qwen2-vl-"):
         # Qwen2-VL vision-language models
@@ -106,7 +114,7 @@ def load_model(model_name: str, **kwargs):
         from model.monkeypatch import replace_attn
         replace_attn(model_id)
 
-        config = AutoConfig.from_pretrained(model_id)
+        config = AutoConfig.from_pretrained(model_id, local_files_only=True)
         if "Qwen3-" in model_id:
             config.rope_scaling = {
                 "rope_type": "yarn",
@@ -123,6 +131,7 @@ def load_model(model_name: str, **kwargs):
                 device_map="auto",
                 attn_implementation='flash_attention_2',
                 config=config,
+                local_files_only=True,
             )
         else:
             model = AutoModelForCausalLM.from_pretrained(
@@ -131,8 +140,9 @@ def load_model(model_name: str, **kwargs):
                 device_map="auto",
                 attn_implementation='flash_attention_2',
                 config=config,
+                local_files_only=True,
             )
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
 
         if "llama" in model_id.lower():
             model.generation_config.pad_token_id = tokenizer.pad_token_id = 128004
@@ -150,6 +160,10 @@ def load_model(model_name: str, **kwargs):
     if is_vlm:
         model.multimodal_token_ids = get_multimodal_token_ids(tokenizer)
         print(f"VLM model detected. Multimodal tokens: {model.multimodal_token_ids}")
+        # Load processor for VLM (handles image/video preprocessing)
+        model.processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+    else:
+        model.processor = None
 
     print(f"\nLoad {model_id} with {model.dtype}")
     return model, tokenizer

@@ -15,6 +15,97 @@ from model.quant_model import OptimINT4KVCache, LlamaForCausalLMW8A8
 from model.template import template
 
 
+def vlm_chunk_fn(
+    ctx_ids: torch.Tensor,
+    chunk_size: int,
+    multimodal_ranges: List[Tuple[int, int]] = []
+) -> Tuple[List[torch.Tensor], List[bool]]:
+    """将 token 序列分块处理，多模态 token 区域单独作为一个 chunk
+
+    用于 VLM 模型的分块处理，确保图像/视频 token 区域作为一个独立的 chunk，
+    这样 pixel_values 只传给包含多模态 token 的那个 chunk。
+
+    Args:
+        ctx_ids: 输入的 token ID 张量，形状为 [batch_size, seq_len]
+        chunk_size: 每个分块的最大 token 数量
+        multimodal_ranges: 多模态 token 的位置范围列表，每个元素为 (start, end)
+
+    Returns:
+        Tuple[List[torch.Tensor], List[bool]]:
+            - 分块后的 token ID 列表
+            - 每个分块是否需要 pixel_values 的标记列表
+
+    Example:
+        ctx_ids = [1, ..., 16200, <|image_pad|>..., 16350, ..., 32000]  # 32000 tokens
+        multimodal_ranges = [(16200, 16350)]  # 图像在位置 16200-16350
+        chunks, needs_vision = vlm_chunk_fn(ctx_ids, 16000, multimodal_ranges)
+        # 返回:
+        # chunks[0] = [0:16200] (纯文本)
+        # chunks[1] = [16200:16350] (图像 token，needs_vision[1]=True)
+        # chunks[2] = [16350:32000] (纯文本)
+    """
+    ctx_len = ctx_ids.shape[1]
+
+    if not multimodal_ranges:
+        # 无多模态 token，使用普通分块
+        return chunk_fn(ctx_ids, chunk_size), [False] * len(chunk_fn(ctx_ids, chunk_size))
+
+    # 构建分块边界点：包含 chunk 边界和多模态区域边界
+    boundaries = set()
+    boundaries.add(0)
+    boundaries.add(ctx_len)
+
+    # 添加 chunk_size 的边界（跳过落在多模态区域内部的边界）
+    if ctx_len > chunk_size:
+        for i in range(1, (ctx_len - 1) // chunk_size + 1):
+            pos = i * chunk_size
+            # 检查 pos 是否落在任何多模态区域内部
+            in_multimodal = False
+            for mm_start, mm_end in multimodal_ranges:
+                if mm_start < pos < mm_end:
+                    in_multimodal = True
+                    break
+            if not in_multimodal:
+                boundaries.add(pos)
+
+    # 添加多模态区域的边界
+    for start, end in multimodal_ranges:
+        boundaries.add(start)
+        boundaries.add(end)
+
+    # 排序边界点
+    boundaries = sorted(boundaries)
+
+    # 过滤掉空区间，生成 chunks
+    chunks = []
+    needs_vision = []
+
+    for i in range(len(boundaries) - 1):
+        start = boundaries[i]
+        end = boundaries[i + 1]
+        if end <= start:
+            continue
+
+        chunk = ctx_ids[:, start:end]
+        if chunk.shape[1] == 0:
+            continue
+
+        # 检查这个 chunk 是否包含多模态 token
+        # 通过检查 chunk 的位置是否与任何多模态区域重叠
+        chunk_has_vision = False
+        for mm_start, mm_end in multimodal_ranges:
+            # chunk [start, end] 与多模态区域 [mm_start, mm_end] 有重叠
+            if start < mm_end and end > mm_start:
+                chunk_has_vision = True
+                break
+
+        chunks.append(chunk)
+        needs_vision.append(chunk_has_vision)
+
+    print(f"chunk inputs, size: {chunk_size} (num {len(chunks)}, {sum(needs_vision)} vision chunks)")
+    return chunks, needs_vision
+
+
 def chunk_fn(ctx_ids: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
     """将 token 序列分块处理
 
@@ -147,6 +238,7 @@ class ModelKVzip():
         # Check if this is a VLM model
         self.is_vlm = getattr(self.model, 'is_vlm', False)
         self.multimodal_token_ids = getattr(self.model, 'multimodal_token_ids', {})
+        self.processor = getattr(self.model, 'processor', None)
 
         # 根据模型类型自动调整 KV cache 类型
         if isinstance(self.model, LlamaForCausalLMW8A8):
@@ -157,6 +249,10 @@ class ModelKVzip():
             # Gemma3 使用 Hybrid cache（交替的 sliding + static layers）
             self.kv_type = "hybrid_static"
             print("[Note] Currently, only retain cache is available for Gemma3")
+        elif self.is_vlm and kv_type == "evict":
+            # VLM 模型使用 retain cache，因为 evict cache 的 flatten 格式与 model.generate 不兼容
+            self.kv_type = "retain"
+            print("[Note] VLM models use retain cache for compatibility with model.generate")
         else:
             # 其他模型使用用户指定的 KV 类型
             self.kv_type = kv_type
@@ -332,6 +428,8 @@ class ModelKVzip():
         kv: Union[RetainCache, EvictCache],
         update_cache: bool = False,
         return_logits: bool = False,
+        pixel_values: Optional[torch.Tensor] = None,
+        image_grid_thw: Optional[torch.Tensor] = None,
         *args,
         **kwargs,
     ):
@@ -366,12 +464,23 @@ class ModelKVzip():
         if isinstance(kv, RetainHybridCache) and not update_cache:
             kv.backup_sliding_cache()
 
+        # 构建视觉参数（仅在首次 prefill 时传入，即 pixel_values 不为 None）
+        vision_kwargs = {}
+        if pixel_values is not None:
+            vision_kwargs["pixel_values"] = pixel_values
+        if image_grid_thw is not None:
+            vision_kwargs["image_grid_thw"] = image_grid_thw
+
         if return_logits:
             # 执行完整 forward，返回 logits（用于概率计算）
-            outputs = self.model(input_ids, past_key_values=kv, *args, **kwargs)
+            outputs = self.model(input_ids, past_key_values=kv, *args, **vision_kwargs, **kwargs)
         else:
             # 只执行 decoder forward，不计算 logits（节省计算）
-            _ = self.model.model(input_ids, past_key_values=kv, *args, **kwargs)
+            if vision_kwargs:
+                # VLM 首次 prefill：需要走完整 model.forward 以处理 pixel_values
+                _ = self.model(input_ids, past_key_values=kv, *args, **vision_kwargs, **kwargs)
+            else:
+                _ = self.model.model(input_ids, past_key_values=kv, *args, **kwargs)
             outputs = None
 
         if not update_cache:
@@ -429,6 +538,7 @@ class ModelKVzip():
         prefill_chunk_size: int = 16000,
         load_score=False,
         do_score=True,
+        vlm_inputs: Optional[dict] = None,
     ) -> Union[RetainCache, EvictCache]:
         """分块预填充 KV cache 并计算 importance scores
 
@@ -447,6 +557,11 @@ class ModelKVzip():
             do_score: 是否执行 importance scoring
                 - True: 完成预填充后立即计算 scores
                 - False: 只预填充，不计算 scores（用于快速测试）
+            vlm_inputs: VLM 视觉输入字典（可选），包含：
+                - pixel_values: 图像 patch 特征张量
+                - image_grid_thw: 图像网格信息（时间/高/宽）
+                仅在首个 prefill chunk 时使用（含图像 token 的那部分）。
+                如果为 None，走纯文本 prefill 路径。
 
         Returns:
             Union[RetainCache, EvictCache]: 填充好的 KV cache 实例
@@ -485,16 +600,32 @@ class ModelKVzip():
         kv.prefill_ids = prefill_ids  # 保存完整预填充 IDs（用于 generate）
 
         # VLM: 检测多模态 token 位置并设置到 KV cache
+        multimodal_ranges_ctx = []  # 基于 ctx_ids 的位置
         if self.is_vlm:
             # 检测 context 中的多模态 token 范围
-            multimodal_ranges = self.detect_multimodal_positions(ctx_ids)
-            if multimodal_ranges:
+            multimodal_ranges_ctx = self.detect_multimodal_positions(ctx_ids)
+            if multimodal_ranges_ctx:
                 # 设置到 KV cache，这些位置的 token 将不会被 scoring/pruning
-                kv.set_multimodal_ranges(multimodal_ranges)
+                kv.set_multimodal_ranges(multimodal_ranges_ctx)
 
         # 分块预填充：避免长 context 导致内存溢出
-        for input_ids in tqdm(chunk_fn(prefill_ids, prefill_chunk_size), desc="Prefill"):
-            self.__call__(input_ids, kv, update_cache=True)  # 填充 KV cache
+        # 将多模态 token 区域转换为 prefill_ids 的位置（加上系统提示长度）
+        sys_prompt_len = self.sys_prompt_ids.shape[1]
+        multimodal_ranges_prefill = [(s + sys_prompt_len, e + sys_prompt_len) for s, e in multimodal_ranges_ctx]
+
+        # 使用 VLM 分块函数，确保多模态 token 单独处理
+        chunks, needs_vision = vlm_chunk_fn(prefill_ids, prefill_chunk_size, multimodal_ranges_prefill)
+
+        for i, input_ids in enumerate(tqdm(chunks, desc="Prefill")):
+            if needs_vision[i] and vlm_inputs is not None:
+                # 包含多模态 token 的 chunk：传入视觉参数
+                pixel_values = vlm_inputs.get("pixel_values")
+                image_grid_thw = vlm_inputs.get("image_grid_thw")
+                self.__call__(input_ids, kv, update_cache=True,
+                              pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+            else:
+                # 纯文本 chunk：不传入视觉参数
+                self.__call__(input_ids, kv, update_cache=True)
 
         if do_score:
             # 计算 KV importance scores
@@ -755,8 +886,8 @@ class ModelKVzip():
         if type(query) == str:
             input_ids = self.encode(query)
 
-        # HuggingFace 的 model.generate 需要完整输入（包含已 cache 的部分）
-        # 内部会自动切片，只处理新 tokens
+        # HuggingFace 的 model.generate 需要完整的 input_ids（包含已 cache 的部分）
+        # 内部会根据 kv.get_seq_length() 自动切片，只处理新 tokens
         if kv.prefill_ids is not None:
             input_ids = torch.cat([kv.prefill_ids, input_ids], dim=1)
 
@@ -764,7 +895,7 @@ class ModelKVzip():
         output = self.model.generate(input_ids, past_key_values=kv, **self.gen_kwargs)
 
         # 解析生成的回答（去掉输入部分和最后的 EOS token）
-        a_ids = output[:, len(input_ids[0]):-1]
+        a_ids = output[:, input_ids.shape[1]:-1]
         a = self.decode(a_ids)
 
         # Cache 状态管理
@@ -775,7 +906,11 @@ class ModelKVzip():
         else:
             # 保留本次 query 和 answer 的 KV，更新 prefill_ids
             # 支持多轮对话
-            kv.prefill_ids = torch.cat([input_ids, a_ids], dim=1)
+            # 注意：此时 kv.prefill_ids 需要更新为包含 query 和 answer
+            if kv.prefill_ids is not None:
+                kv.prefill_ids = torch.cat([kv.prefill_ids, input_ids, a_ids], dim=1)
+            else:
+                kv.prefill_ids = torch.cat([input_ids, a_ids], dim=1)
 
         return a
 

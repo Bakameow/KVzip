@@ -99,10 +99,13 @@ def llama_qwen_attn_forward(
 def qwen_vl_attn_forward(
     self,
     hidden_states: torch.Tensor,
-    position_embeddings: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
     past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     """Attention forward for Qwen-VL models with multimodal token support.
@@ -112,16 +115,22 @@ def qwen_vl_attn_forward(
 
     Args:
         hidden_states: Input hidden states
-        position_embeddings: Tuple of (cos, sin, mrope_section) for multimodal RoPE
         attention_mask: Attention mask
+        position_ids: Position indices (not used directly, kept for compatibility)
         past_key_value: KV cache
+        output_attentions: Whether to output attention weights
+        use_cache: Whether to use KV cache
         cache_position: Position indices for cache
+        position_embeddings: Tuple of (cos, sin) for multimodal RoPE
 
     Note:
         Multimodal tokens (image/video) are marked in the KV cache and will
         NOT be scored or pruned during KV compression.
     """
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+    try:
+        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import apply_multimodal_rotary_pos_emb
+    except ImportError:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
 
     bsz, q_len, _ = hidden_states.size()
     input_shape = hidden_states.shape[:-1]
@@ -132,7 +141,9 @@ def qwen_vl_attn_forward(
     value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
     # Apply multimodal rotary position embeddings
-    cos, sin, mrope_section = position_embeddings
+    cos, sin = position_embeddings
+    # mrope_section is stored in self.rope_scaling for both Qwen2-VL and Qwen2.5-VL
+    mrope_section = self.rope_scaling["mrope_section"]
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states, key_states, cos, sin, mrope_section
     )
@@ -192,7 +203,7 @@ def qwen_vl_attn_forward(
     attn_output = self.o_proj(attn_output)
 
     attn_weights = None
-    return attn_output, attn_weights
+    return attn_output, attn_weights, None
 
 
 def gemma3_attn_forward(
