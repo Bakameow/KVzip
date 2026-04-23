@@ -629,89 +629,166 @@ class ModelKVzip():
 
         if do_score:
             # 计算 KV importance scores
-            # 使用 context reconstruction 任务：让模型 "repeat" context 各部分
-            # 注意：多模态 token 会被跳过 scoring，自动分配 inf score
-            self.scoring(kv, ctx_ids, load_score=load_score)
+            # VLM 时传入 image_grid_thw，用于 vision chunk 的 patch 行级二次分块
+            image_grid_thw = vlm_inputs.get("image_grid_thw") if vlm_inputs else None
+            self.scoring(kv, ctx_ids, load_score=load_score, image_grid_thw=image_grid_thw)
 
         return kv
+
+    def _split_vision_chunk(
+        self,
+        vision_ids: torch.Tensor,
+        image_grid_thw: Optional[torch.Tensor],
+        scoring_patch_rows: int,
+    ) -> List[torch.Tensor]:
+        """将单个 vision chunk 按 patch 行进行二次分块
+
+        对于大图像，直接对整个 vision chunk 做 scoring 会导致内存溢出。
+        根据 image_grid_thw 中的 (T, H, W) 信息，按 patch 行将 vision chunk
+        切分为若干 sub-chunk，每个 sub-chunk 包含 scoring_patch_rows 行的 patch token。
+
+        每行的 token 数 = W // spatial_merge_size（经过 PatchMerger 合并后）。
+        spatial_merge_size 从模型 config 中读取（Qwen2.5-VL 默认为 2）。
+
+        Args:
+            vision_ids: 当前 vision chunk 的 token IDs，形状 [1, n_vision_tokens]
+            image_grid_thw: 图像网格信息，形状 [n_images, 3]，每行为 (T, H, W)
+                            如果为 None，则不分块，直接返回原 chunk
+            scoring_patch_rows: 每个 sub-chunk 包含的 patch 行数
+
+        Returns:
+            List[torch.Tensor]: 分块后的 vision sub-chunk 列表
+        """
+        if image_grid_thw is None or scoring_patch_rows <= 0:
+            return [vision_ids]
+
+        # 获取 spatial_merge_size（默认 2，适用于 Qwen2-VL / Qwen2.5-VL）
+        spatial_merge_size = getattr(
+            getattr(self.config, 'vision_config', None), 'spatial_merge_size', 2
+        )
+
+        n_vision = vision_ids.shape[1]
+        sub_chunks = []
+        offset = 0  # 在 vision_ids 中的当前偏移
+
+        for thw in image_grid_thw:
+            t, h, w = thw[0].item(), thw[1].item(), thw[2].item()
+            # 经过 PatchMerger 后，每行 token 数
+            tokens_per_row = w // spatial_merge_size
+            # 该图像在 LLM 中的总 token 数
+            total_img_tokens = t * (h // spatial_merge_size) * tokens_per_row
+
+            if offset >= n_vision:
+                break
+
+            img_end = min(offset + total_img_tokens, n_vision)
+            img_ids = vision_ids[:, offset:img_end]
+
+            # 按 scoring_patch_rows 行切分
+            tokens_per_sub = scoring_patch_rows * tokens_per_row
+            if tokens_per_sub <= 0 or img_ids.shape[1] <= tokens_per_sub:
+                sub_chunks.append(img_ids)
+            else:
+                pos = 0
+                while pos < img_ids.shape[1]:
+                    sub_chunks.append(img_ids[:, pos:pos + tokens_per_sub])
+                    pos += tokens_per_sub
+
+            offset = img_end
+
+        # 若有剩余（如 vision_start/vision_end 特殊 token），作为单独 chunk
+        if offset < n_vision:
+            sub_chunks.append(vision_ids[:, offset:])
+
+        if not sub_chunks:
+            return [vision_ids]
+
+        n_sub = len(sub_chunks)
+        if n_sub > 1:
+            print(f"  vision chunk split into {n_sub} sub-chunks (scoring_patch_rows={scoring_patch_rows})")
+        return sub_chunks
 
     def self_task(
         self,
         ctx_ids: torch.Tensor,
         chunk_size: int = 2000,
         prev_postfix_size=8,
+        multimodal_ranges: List[Tuple[int, int]] = [],
+        image_grid_thw: Optional[torch.Tensor] = None,
+        scoring_patch_rows: int = 4,
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """构建 Context Reconstruction 任务的分块输入
 
         这是 KVzip importance scoring 的核心设计：通过让模型"复述" context 的各个部分，
         来观察模型在生成时 attend 到了哪些 KV pairs，从而确定每个 KV 的重要性。
 
+        对于 VLM 模型：
+        1. 使用多模态感知分块（vlm_chunk_fn），确保多模态 token 区域单独成 chunk
+        2. 对大 vision chunk 按 patch 行进行二次分块（_split_vision_chunk），
+           避免超大图像的 scoring 导致内存溢出
+
         Args:
             ctx_ids: Context 的 token IDs，形状为 [batch_size, ctx_len]
             chunk_size: Scoring 时的分块大小（默认 2000 tokens）
-                - 每个 chunk 独立执行一次 "repeat" forward pass
-                - 较小的 chunk_size 可以更精细地计算 importance
             prev_postfix_size: 前一块末尾保留的 token 数量（默认 8）
-                - 用于给模型提供"锚点"，帮助定位复述的起始位置
+            multimodal_ranges: 多模态 token 的位置范围列表（相对于 ctx_ids）
+            image_grid_thw: 图像网格信息 [n_images, 3]，用于 vision chunk 的二次分块
+            scoring_patch_rows: vision chunk 二次分块时每个 sub-chunk 的 patch 行数
 
         Returns:
             List[Tuple[torch.Tensor, torch.Tensor]]: 每个分块的任务输入
-                每个元素是 (prefill_ids_p, repeat_ids_p):
-                - prefill_ids_p: 当前 chunk 的内容（用于确定 score 记录范围）
-                - repeat_ids_p: 完整的 repeat 输入（query + postfix + chunk 内容）
-
-        设计原理:
-            ┌─────────────────────────────────────────────────────────────────┐
-            │ Chunk 0: tokens[0:2000]                                         │
-            │ Query: "Repeat the previous context exactly."                   │
-            │ 模型生成 chunk0 内容时，会 attend 到 chunk0 的 KV               │
-            │ 记录 positions [0:2000] 的 attention weights 作为 importance    │
-            ├─────────────────────────────────────────────────────────────────┤
-            │ Chunk 1: tokens[2000:4000]                                      │
-            │ Query: "Repeat ... starting with [chunk0末尾8 tokens]"          │
-            │ 模型生成 chunk1 内容时，会 attend 到 chunk1 的 KV               │
-            │ 记录 positions [2000:4000] 的 attention weights                 │
-            └─────────────────────────────────────────────────────────────────┘
-
-        为什么后续 chunk 要加前一块末尾 8 tokens?
-            - 提供连续性"锚点"，让模型知道从哪里开始复述
-            - 这 8 tokens 作为 query的一部分，模型会自然 attend 到它们之后的 KV
-            - 避免 chunk 之间的"断裂"导致 attention 分布不准确
-
-        Example:
-            context = "Hello world. This is a test..."  # 8000 tokens
-            tasks = model.self_task(ctx_ids, chunk_size=2000)
-            # 返回 4 个分块任务:
-            # tasks[0] = (chunk0_ids, "Repeat the previous context exactly." + postfix + chunk0)
-            # tasks[1] = (chunk1_ids, "Repeat ... starting with [chunk0末尾]" + postfix + chunk1)
-            # ...
+                每个元素是 (chunk_ids, repeat_ids_p)
         """
-        # 将 context 分块
-        chunked_inputs = chunk_fn(ctx_ids, chunk_size)
+        # 使用多模态感知分块，确保多模态区域单独成 chunk
+        chunked_inputs, is_multimodal_chunk = vlm_chunk_fn(ctx_ids, chunk_size, multimodal_ranges)
 
         input_ids = []
-        for i, a_ids in enumerate(chunked_inputs):
-            # 构建每个 chunk 的 query
-            if i == 0:
-                # 第一个 chunk: 直接要求复述整个 context
-                prompt = f"\n\nRepeat the previous context exactly."
-                q_ids = self.encode(prompt)
-            else:
-                # 后续 chunk: 给出前一块末尾作为"锚点"
-                prompt = f"\n\nRepeat the part of the previous context exactly, starting with "
-                q_ids = self.encode(prompt)
-                # 取前一块的末尾 tokens 作为提示
-                postfix_prev = chunked_inputs[i - 1][:, -prev_postfix_size:]
-                q_ids = torch.cat([q_ids, postfix_prev], dim=1)
+        prev_chunk = None
+        first_chunk = True
+        # 跟踪已处理的图像索引（用于 _split_vision_chunk 时按序分配 grid_thw）
+        img_idx = 0
 
-            # 构建完整的 repeat 输入
-            # (chunk内容, query + postfix + chunk内容)
-            # chunk内容用于确定 scoring 的 start_idx 和 end_idx
-            # repeat_ids_p 用于实际 forward pass
-            input_ids.append((
-                a_ids,  # 当前 chunk 的内容
-                torch.cat([q_ids, self.postfix_ids, a_ids], dim=1)  # 完整 repeat 输入
-            ))
+        for i, a_ids in enumerate(chunked_inputs):
+            if is_multimodal_chunk[i] and image_grid_thw is not None:
+                # 对 vision chunk 按 patch 行进行二次分块
+                # 计算当前 vision chunk 对应哪些图像（按顺序分配）
+                n_vision_tokens = a_ids.shape[1]
+                spatial_merge_size = getattr(
+                    getattr(self.config, 'vision_config', None), 'spatial_merge_size', 2
+                )
+                # 找出属于当前 vision chunk 的 image_grid_thw 条目
+                chunk_grids = []
+                consumed = 0
+                j = img_idx
+                while j < image_grid_thw.shape[0] and consumed < n_vision_tokens:
+                    t, h, w = image_grid_thw[j][0].item(), image_grid_thw[j][1].item(), image_grid_thw[j][2].item()
+                    img_tokens = t * (h // spatial_merge_size) * (w // spatial_merge_size)
+                    chunk_grids.append(image_grid_thw[j:j+1])
+                    consumed += img_tokens
+                    j += 1
+                img_idx = j
+
+                grids_for_chunk = torch.cat(chunk_grids, dim=0) if chunk_grids else None
+                sub_chunks = self._split_vision_chunk(a_ids, grids_for_chunk, scoring_patch_rows)
+            else:
+                sub_chunks = [a_ids]
+
+            for sub in sub_chunks:
+                if first_chunk:
+                    prompt = f"\n\nRepeat the previous context exactly."
+                    q_ids = self.encode(prompt)
+                    first_chunk = False
+                else:
+                    prompt = f"\n\nRepeat the part of the previous context exactly, starting with "
+                    q_ids = self.encode(prompt)
+                    postfix_prev = prev_chunk[:, -prev_postfix_size:]
+                    q_ids = torch.cat([q_ids, postfix_prev], dim=1)
+
+                input_ids.append((
+                    sub,
+                    torch.cat([q_ids, self.postfix_ids, sub], dim=1)
+                ))
+                prev_chunk = sub
 
         return input_ids
 
@@ -721,6 +798,8 @@ class ModelKVzip():
         kv: Union[RetainCache, EvictCache],
         ctx_ids: torch.Tensor,
         load_score=False,
+        image_grid_thw: Optional[torch.Tensor] = None,
+        scoring_patch_rows: int = 4,
     ):
         """计算 KV cache 的重要性分数
 
@@ -779,9 +858,14 @@ class ModelKVzip():
             # Step 2: 保存原始 start_idx（scoring 后会恢复）
             start_idx_tmp = kv.start_idx  # 通常是系统提示长度（如 50）
 
-            # Step 3: 构建分块的 repeat 任务
+            # Step 3: 构建分块的 repeat 任务（VLM 时传入多模态范围和图像网格信息）
             kv.end_idx = 0  # 初始化 end_idx
-            input_ids = self.self_task(ctx_ids)  # 返回 List[(chunk_ids, repeat_ids)]
+            input_ids = self.self_task(
+                ctx_ids,
+                multimodal_ranges=kv.multimodal_ranges,
+                image_grid_thw=image_grid_thw,
+                scoring_patch_rows=scoring_patch_rows,
+            )  # 返回 List[(chunk_ids, repeat_ids)]
 
             # Step 4: 对每个 chunk 执行 forward，计算 score
             for i, (prefill_ids_p, repeat_ids_p) in enumerate(
