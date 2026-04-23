@@ -1,4 +1,5 @@
 from collections import defaultdict
+from loguru import logger
 
 
 def set_ratios(model_name):
@@ -24,7 +25,7 @@ if __name__ == "__main__":
 
     tt = TimeStamp(True)
     max_idx = min(args.idx + args.num, len(dataset))
-    print("=" * 80, f"\nStart evaluation with {args.idx}~{max_idx} samples")
+    logger.info("=" * 80 + f"\nStart evaluation with {args.idx}~{max_idx} samples")
 
     for data_idx in range(args.idx, max_idx):
         kv = dataset.prefill_context(data_idx, load_score=args.level == "head")
@@ -43,4 +44,4 @@ if __name__ == "__main__":
 
         tt(f"{args.data}-{data_idx}")
         del kv, inputs, info, eval
-    print("Finished.")
+    logger.info("Finished.")

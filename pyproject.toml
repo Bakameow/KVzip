@@ -29,6 +29,7 @@ dependencies = [
     "flash_attn",
     "yt-dlp>=2026.3.17",
     "av>=17.0.1",
+    "loguru>=0.7.3",
 ]
 
 [tool.setuptools.packages.find]

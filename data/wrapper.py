@@ -2,6 +2,7 @@ import os
 import torch
 from typing import List, Tuple, Union, Optional
 from collections import defaultdict
+from loguru import logger
 
 from attention.kvcache import RetainCache, EvictCache
 from model import ModelKVzip
@@ -149,13 +150,21 @@ class DataWrapper():
             if ctx_ids is None:
                 # Fallback to empty context
                 ctx_ids = self.model.encode("(Video unavailable)")
+            # TODO: 后续需要恢复此处逻辑，改用 processor max_pixels 限制分辨率（方案 A）
+            # 当前临时跳过 token 数超限的视频，避免 OOM
+            elif ctx_ids.shape[1] > 20000:
+                logger.warning(f"[skip] video token count {ctx_ids.shape[1]} exceeds limit 20000, falling back to empty context")
+                ctx_ids = self.model.encode("(Video too large, skipped)")
+                vlm_inputs = None
         else:
             ctx_ids = self.model.encode(data['context'])
 
         kv = self.model.prefill(ctx_ids, load_score=load_score, vlm_inputs=vlm_inputs)
 
         print(f"# prefill {self.model.name} {self.name}-{idx}:", end=" ")
-        print(f"{ctx_ids.shape[1] if hasattr(ctx_ids, 'shape') else len(ctx_ids[0])} tokens, KV cache {kv._mem()} GB, {kv.key_cache[0].dtype}")
+        logger.info(f"prefill {self.model.name} {self.name}-{idx}: "
+                    f"{ctx_ids.shape[1] if hasattr(ctx_ids, 'shape') else len(ctx_ids[0])} tokens, "
+                    f"KV cache {kv._mem()} GB, {kv.key_cache[0].dtype}")
         return kv
 
     def _prepare_query(self, data, kv, inputs: dict, task: str):
@@ -163,7 +172,7 @@ class DataWrapper():
             For each task, we store (query, answer, grount_truth) in inputs
         """
         if task in ["qa", "reason"]:
-            print("# Generated output | Ground truth")
+            logger.info("Generated output | Ground truth")
             for i, (q, gt) in enumerate(zip(data['question'], data['answers'])):
                 q = get_query(task, q)
                 q_ids = self.model.apply_template(q)
@@ -177,7 +186,8 @@ class DataWrapper():
                 inputs[tag] = {"q": q_ids, "a": a_ids, "gt": gt_ids}
                 inputs["eval_task"].append(tag)
 
-                print(f"[QA {i}] {a} | {gt}")
+                logger.info(f"[QA {i}] Q: {q.strip()}")
+                logger.info(f"[QA {i}] pred: {a} | gt: {gt}")
 
         else:
             q = get_query(task)

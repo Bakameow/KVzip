@@ -2,6 +2,7 @@ import torch
 import os
 import json
 from time import time
+from loguru import logger
 
 
 def set_gen_length(dataname, model=None):
@@ -18,7 +19,7 @@ def set_gen_length(dataname, model=None):
 
     if model is not None:
         model.gen_kwargs["max_new_tokens"] = max_len
-    print(f"set generation length: {max_len}")
+    logger.info(f"set generation length: {max_len}")
     return max_len
 
 
@@ -76,6 +77,5 @@ class TimeStamp():
             torch.cuda.synchronize()
             allc_mem, total_mem = gmem(print=False)
             tt = self.elapsed(denominator)
-            print(f"## Time: {tt}{self.unit}. Mem: {allc_mem:.2f}/{total_mem:.2f} GB. [{msg}]")
-            print(flush=True)
+            logger.info(f"## Time: {tt}{self.unit}. Mem: {allc_mem:.2f}/{total_mem:.2f} GB. [{msg}]")
             self.set()

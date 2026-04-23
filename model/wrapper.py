@@ -6,6 +6,7 @@ import torch
 import glob
 from typing import List, Tuple, Union, Optional
 from tqdm import tqdm
+from loguru import logger
 from transformers import DynamicCache, Gemma3ForCausalLM, Qwen3ForCausalLM
 
 from attention.kvcache import RetainCache, EvictCache, RetainHybridCache
@@ -102,7 +103,7 @@ def vlm_chunk_fn(
         chunks.append(chunk)
         needs_vision.append(chunk_has_vision)
 
-    print(f"chunk inputs, size: {chunk_size} (num {len(chunks)}, {sum(needs_vision)} vision chunks)")
+    logger.debug(f"chunk inputs, size: {chunk_size} (num {len(chunks)}, {sum(needs_vision)} vision chunks)")
     return chunks, needs_vision
 
 
@@ -127,7 +128,7 @@ def chunk_fn(ctx_ids: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
     # 如果序列长度超过分块大小，则进行分块
     if ctx_len > chunk_size:
         chunk_num = (ctx_len - 1) // chunk_size + 1  # 计算需要的分块数量
-        print(f"chunk inputs, size: {chunk_size} (num {chunk_num})")
+        logger.debug(f"chunk inputs, size: {chunk_size} (num {chunk_num})")
 
         input_ids = []
         for i in range(chunk_num):
@@ -177,7 +178,7 @@ def load_head_score(model_name, ctx_len):
     for path in glob.glob(paths):
         attn = torch.load(path).squeeze().cuda()  # 形状: [n_layers, n_heads]
         attn_.append(attn)
-        print("Load head-score from", path)
+        logger.info(f"Load head-score from {path}")
 
     # 取多个数据集 score 的最大值（保守策略：重要的 head 在任何任务中都重要）
     attn = torch.stack(attn_, dim=0).amax(0)  # [n_layers, n_heads]
@@ -242,24 +243,20 @@ class ModelKVzip():
 
         # 根据模型类型自动调整 KV cache 类型
         if isinstance(self.model, LlamaForCausalLMW8A8):
-            # QServe 量化模型，使用 INT4 static cache
             self.kv_type = "int4static"
-            print("[Note] Currently, only retain cache is available for QServe")
+            logger.warning("[Note] Currently, only retain cache is available for QServe")
         elif isinstance(self.model, Gemma3ForCausalLM):
-            # Gemma3 使用 Hybrid cache（交替的 sliding + static layers）
             self.kv_type = "hybrid_static"
-            print("[Note] Currently, only retain cache is available for Gemma3")
+            logger.warning("[Note] Currently, only retain cache is available for Gemma3")
         elif self.is_vlm and kv_type == "evict":
-            # VLM 模型使用 retain cache，因为 evict cache 的 flatten 格式与 model.generate 不兼容
             self.kv_type = "retain"
-            print("[Note] VLM models use retain cache for compatibility with model.generate")
+            logger.warning("[Note] VLM models use retain cache for compatibility with model.generate")
         else:
-            # 其他模型使用用户指定的 KV 类型
             self.kv_type = kv_type
-        print(f"KV type: {self.kv_type}")
+        logger.info(f"KV type: {self.kv_type}")
 
         if self.is_vlm:
-            print(f"[VLM] Multimodal tokens will be preserved during KV pruning")
+            logger.info("[VLM] Multimodal tokens will be preserved during KV pruning")
 
         # 设置生成参数：贪婪解码，最大 512 new tokens
         self.gen_kwargs = {
@@ -346,7 +343,7 @@ class ModelKVzip():
             i += 1
 
         if ranges:
-            print(f"[VLM] Detected {len(ranges)} multimodal token ranges: {ranges}")
+            logger.debug(f"[VLM] Detected {len(ranges)} multimodal token ranges: {ranges}")
 
         return ranges
 
@@ -710,7 +707,7 @@ class ModelKVzip():
 
         n_sub = len(sub_chunks)
         if n_sub > 1:
-            print(f"  vision chunk split into {n_sub} sub-chunks (scoring_patch_rows={scoring_patch_rows})")
+            logger.debug(f"  vision chunk split into {n_sub} sub-chunks (scoring_patch_rows={scoring_patch_rows})")
         return sub_chunks
 
     def self_task(

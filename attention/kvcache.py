@@ -6,6 +6,7 @@
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+from loguru import logger
 from attention.score import HybridKVScore, KVScore
 from tiny_api_cuda import update_flatten_view
 from transformers import DynamicCache, HybridCache
@@ -135,7 +136,7 @@ class EvictCache(DynamicCache, KVScore):
 
         self.prepare_init()
         self.pruned = True
-        print(f"ratio {r_:.2f} ({level}), {self._mem()} GB (evict {rmv.sum():.0f} pairs)")
+        logger.info(f"ratio {r_:.2f} ({level}), {self._mem()} GB (evict {rmv.sum():.0f} pairs)")
         return thres, r_
 
     def _get_valid(self, layer_idx: int, n_seq: int):
@@ -296,7 +297,7 @@ class RetainCache(DynamicCache, KVScore):
         rmv = (self.valid == False).float()  # evicted KV pairs
         r_ = 1 - rmv.mean().item()  # real compression ratio
         self.pruned = True
-        print(f"ratio {r_:.2f} ({level}), threshold {thres:.4f} (evict {rmv.sum():.0f} pairs)")
+        logger.info(f"ratio {r_:.2f} ({level}), threshold {thres:.4f} (evict {rmv.sum():.0f} pairs)")
         return thres, r_
 
     def _get_valid(self, layer_idx: int, n_seq: int):
@@ -561,7 +562,7 @@ class RetainHybridCache(HybridCache, HybridKVScore):
         rmv = (self.valid == False).float()  # evicted KV pairs
         r_ = 1 - rmv.mean().item()  # real compression ratio
         self.pruned = True
-        print(f"ratio {r_:.2f} ({level}), threshold {thres:.4f} (evict {rmv.sum():.0f} pairs)")
+        logger.info(f"ratio {r_:.2f} ({level}), threshold {thres:.4f} (evict {rmv.sum():.0f} pairs)")
         return thres, r_
 
     def prepare(

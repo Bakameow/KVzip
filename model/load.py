@@ -7,6 +7,7 @@ os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 import torch
+from loguru import logger
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
 
 
@@ -52,6 +53,7 @@ def get_model_id(name: str):
     elif name.startswith("qwen3-vl-"):
         # Future Qwen3-VL (placeholder, will use Qwen2.5-VL as fallback)
         print(f"Note: Qwen3-VL may not be released yet. Using Qwen2.5-VL as fallback.")
+        logger.warning("Qwen3-VL may not be released yet. Using Qwen2.5-VL as fallback.")
         assert size in ["3", "7", "72"], "Model is not supported!"
         return f"Qwen/Qwen2.5-VL-{size}B-Instruct"
 
@@ -160,12 +162,13 @@ def load_model(model_name: str, **kwargs):
     if is_vlm:
         model.multimodal_token_ids = get_multimodal_token_ids(tokenizer)
         print(f"VLM model detected. Multimodal tokens: {model.multimodal_token_ids}")
-        # Load processor for VLM (handles image/video preprocessing)
+        logger.info(f"VLM model detected. Multimodal tokens: {model.multimodal_token_ids}")
         model.processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
     else:
         model.processor = None
 
     print(f"\nLoad {model_id} with {model.dtype}")
+    logger.info(f"Load {model_id} with {model.dtype}")
     return model, tokenizer
 
 
