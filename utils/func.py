@@ -11,6 +11,8 @@ def set_gen_length(dataname, model=None):
         max_len = 256
     elif "gsm" in dataname or "repoqa" in dataname:
         max_len = 512
+    elif "video_mme" in dataname:
+        max_len = 64  # multiple-choice answers are short
     else:
         max_len = 96
 

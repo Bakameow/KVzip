@@ -30,6 +30,8 @@ def load_dataset_all(name, tokenizer, n_data=100):
         dataset = load_gsm(tokenizer, n_data)
     elif "scbench" in name:
         dataset = load_scbench(name)
+    elif name.startswith("video_mme"):
+        dataset = load_video_mme(name, n_data)
     else:
         raise ValueError(f"Invalid dataset: {name}")
 
@@ -120,6 +122,81 @@ def load_scbench(name):
                 gt = str(gt)
             d["answers"].append(gt)
 
+        dataset.append(d)
+
+    return dataset
+
+
+def load_video_mme(name, n_data):
+    """Load Video-MME benchmark.
+
+    Name format:  video_mme[_video][_short|_medium|_long]
+      - video_mme              : subtitle-only, all durations
+      - video_mme_video        : video frames, all durations
+      - video_mme_short        : subtitle-only, short videos only  (<2 min)
+      - video_mme_video_short  : video frames,  short videos only  (<2 min)
+      - video_mme_medium       : subtitle-only, medium videos only (4-15 min)
+      - video_mme_video_medium : video frames,  medium videos only (4-15 min)
+      - video_mme_long         : subtitle-only, long videos only   (30-60 min)
+      - video_mme_video_long   : video frames,  long videos only   (30-60 min)
+
+    Dataset: lmms-lab/Video-MME on HuggingFace
+    The local cached version uses field 'duration' (not 'duration_category'),
+    and does not include 'subtitle' or 'video_path' fields.
+    Video files must be placed at: data/video_mme/<videoID>.mp4
+    """
+    use_video = "_video" in name
+    duration_filter = None
+    for tag in ("short", "medium", "long"):
+        if name.endswith(tag):
+            duration_filter = tag
+            break
+
+    samples = load_dataset("lmms-lab/Video-MME", split="test")
+
+    from collections import OrderedDict
+    pool = OrderedDict()
+    for item in samples:
+        # local cache uses 'duration', not 'duration_category'
+        dur = item.get("duration") or item.get("duration_category", "")
+        if duration_filter and dur != duration_filter:
+            continue
+
+        vid = item["video_id"]
+        if vid not in pool:
+            video_id = item.get("videoID", item.get("video_id", ""))
+            pool[vid] = {
+                "video_id": vid,
+                "videoID": video_id,
+                "video_path": f"data/video_mme/{video_id}.mp4",
+                "url": item.get("url", ""),
+                "duration": dur,
+                "subtitle": item.get("subtitle", "") or "",
+                "question": [],
+                "answers": [],
+            }
+        q = item["question"]
+        opts = item.get("options", [])
+        if opts:
+            # options may already include letter prefix like "A. xxx"
+            if opts[0].startswith(("A.", "A ")):
+                opts_str = " ".join(f"({o[0]}) {o[2:].strip()}" for o in opts)
+            else:
+                opts_str = " ".join(f"({chr(65+i)}) {o}" for i, o in enumerate(opts))
+            q = f"{q} {opts_str}"
+        pool[vid]["question"].append(q)
+        pool[vid]["answers"].append(item["answer"])
+
+        if len(pool) >= n_data:
+            break
+
+    dataset = []
+    for vid, d in pool.items():
+        if use_video:
+            d["context"] = ""  # filled at prefill time from video frames
+        else:
+            subtitle = d.pop("subtitle", "")
+            d["context"] = f"Video subtitles:\n{subtitle}" if subtitle else "(No subtitles available)"
         dataset.append(d)
 
     return dataset

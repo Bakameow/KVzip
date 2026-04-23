@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import List, Tuple, Union, Optional
 from collections import defaultdict
@@ -24,6 +25,110 @@ def get_query(task, q=None):
     return query
 
 
+def _ensure_video(data) -> str:
+    """Download video if not present locally. Returns local path or empty string on failure.
+
+    Uses yt-dlp Python API (import yt_dlp) so no external binary is required.
+    Install with: pip install yt-dlp
+    """
+    video_path = data.get("video_path", "")
+    if video_path and os.path.exists(video_path):
+        return video_path
+
+    # Dataset field 'videoID' holds the YouTube video ID (e.g. "fFjv93ACGo8")
+    # 'video_id' is the sequential index ("001") — not the YouTube ID
+    yt_id = data.get("videoID") or data.get("video_id", "")
+    url = data.get("url", "")
+    if not yt_id and not url:
+        return ""
+
+    os.makedirs("data/video_mme", exist_ok=True)
+    if not video_path:
+        video_path = f"data/video_mme/{yt_id}.mp4"
+
+    yt_url = url if url else f"https://www.youtube.com/watch?v={yt_id}"
+    print(f"[video_mme] Downloading {yt_id} -> {video_path} ...")
+
+    try:
+        import yt_dlp
+    except ImportError:
+        print("[video_mme] yt-dlp not installed. Run: pip install yt-dlp")
+        return ""
+
+    ydl_opts = {
+        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+        "outtmpl": video_path,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([yt_url])
+    except Exception as e:
+        print(f"[video_mme] Download failed: {e}")
+        return ""
+
+    if not os.path.exists(video_path):
+        print(f"[video_mme] File not found after download: {video_path}")
+        return ""
+
+    print(f"[video_mme] Saved to {video_path}")
+    return video_path
+
+
+def _build_video_vlm_inputs(data, model: ModelKVzip):
+    """Build ctx_ids and vlm_inputs from a video_mme sample using the VLM processor.
+
+    Returns (ctx_ids, vlm_inputs) where vlm_inputs may be None for subtitle-only mode.
+    Downloads the video via yt-dlp if not present locally.
+    """
+    if not model.is_vlm:
+        return None, None
+
+    video_path = _ensure_video(data)
+    if not video_path:
+        return None, None
+
+    import av
+
+    processor = model.processor
+    max_frames = 32
+    try:
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        total = stream.frames or 0
+        step = max(1, total // max_frames)
+        frames = []
+        for i, frame in enumerate(container.decode(video=0)):
+            if i % step == 0:
+                frames.append(frame.to_image())
+            if len(frames) >= max_frames:
+                break
+        container.close()
+    except Exception as e:
+        print(f"[video_mme] Failed to decode {video_path}: {e}")
+        return None, None
+
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video": frames},
+        {"type": "text", "text": "Watch the video carefully."},
+    ]}]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+    inputs = processor(text=[text], videos=[frames], return_tensors="pt")
+
+    full_ids = inputs["input_ids"].cuda()
+    user_start_token = model.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)[-1]
+    positions = (full_ids[0] == user_start_token).nonzero(as_tuple=True)[0]
+    ctx_ids = full_ids[:, positions[0].item():]
+
+    vlm_inputs = {
+        "pixel_values_videos": inputs["pixel_values_videos"].cuda(),
+        "video_grid_thw": inputs["video_grid_thw"].cuda(),
+    }
+    return ctx_ids, vlm_inputs
+
+
 class DataWrapper():
 
     def __init__(self, dataname, dataset, model: ModelKVzip):
@@ -37,12 +142,20 @@ class DataWrapper():
         """ Prefill and scoring KV importance
         """
         data = self.dataset[idx]
-        ctx_ids = self.model.encode(data['context'])
 
-        kv = self.model.prefill(ctx_ids, load_score=load_score)
+        vlm_inputs = None
+        if "video_mme_video" in self.name:
+            ctx_ids, vlm_inputs = _build_video_vlm_inputs(data, self.model)
+            if ctx_ids is None:
+                # Fallback to empty context
+                ctx_ids = self.model.encode("(Video unavailable)")
+        else:
+            ctx_ids = self.model.encode(data['context'])
+
+        kv = self.model.prefill(ctx_ids, load_score=load_score, vlm_inputs=vlm_inputs)
 
         print(f"# prefill {self.model.name} {self.name}-{idx}:", end=" ")
-        print(f"{len(ctx_ids[0])} tokens, KV cache {kv._mem()} GB, {kv.key_cache[0].dtype}")
+        print(f"{ctx_ids.shape[1] if hasattr(ctx_ids, 'shape') else len(ctx_ids[0])} tokens, KV cache {kv._mem()} GB, {kv.key_cache[0].dtype}")
         return kv
 
     def _prepare_query(self, data, kv, inputs: dict, task: str):

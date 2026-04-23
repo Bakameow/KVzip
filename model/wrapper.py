@@ -430,6 +430,8 @@ class ModelKVzip():
         return_logits: bool = False,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
         *args,
         **kwargs,
     ):
@@ -464,12 +466,16 @@ class ModelKVzip():
         if isinstance(kv, RetainHybridCache) and not update_cache:
             kv.backup_sliding_cache()
 
-        # 构建视觉参数（仅在首次 prefill 时传入，即 pixel_values 不为 None）
+        # 构建视觉参数（仅在首次 prefill 时传入）
         vision_kwargs = {}
         if pixel_values is not None:
             vision_kwargs["pixel_values"] = pixel_values
         if image_grid_thw is not None:
             vision_kwargs["image_grid_thw"] = image_grid_thw
+        if pixel_values_videos is not None:
+            vision_kwargs["pixel_values_videos"] = pixel_values_videos
+        if video_grid_thw is not None:
+            vision_kwargs["video_grid_thw"] = video_grid_thw
 
         if return_logits:
             # 执行完整 forward，返回 logits（用于概率计算）
@@ -619,19 +625,18 @@ class ModelKVzip():
         for i, input_ids in enumerate(tqdm(chunks, desc="Prefill")):
             if needs_vision[i] and vlm_inputs is not None:
                 # 包含多模态 token 的 chunk：传入视觉参数
-                pixel_values = vlm_inputs.get("pixel_values")
-                image_grid_thw = vlm_inputs.get("image_grid_thw")
-                self.__call__(input_ids, kv, update_cache=True,
-                              pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+                self.__call__(input_ids, kv, update_cache=True, **vlm_inputs)
             else:
                 # 纯文本 chunk：不传入视觉参数
                 self.__call__(input_ids, kv, update_cache=True)
 
         if do_score:
             # 计算 KV importance scores
-            # VLM 时传入 image_grid_thw，用于 vision chunk 的 patch 行级二次分块
-            image_grid_thw = vlm_inputs.get("image_grid_thw") if vlm_inputs else None
-            self.scoring(kv, ctx_ids, load_score=load_score, image_grid_thw=image_grid_thw)
+            # VLM 时传入 grid_thw，用于 vision chunk 的 patch 行级二次分块
+            grid_thw = None
+            if vlm_inputs:
+                grid_thw = vlm_inputs.get("image_grid_thw") or vlm_inputs.get("video_grid_thw")
+            self.scoring(kv, ctx_ids, load_score=load_score, image_grid_thw=grid_thw)
 
         return kv
 

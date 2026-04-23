@@ -208,6 +208,12 @@ def evaluate_answer(preds, refs, dataname, format, similarity=False, subtask=Non
                     score.append(rouge_score(pred, ref))
                     print("rouge_score..", end="\r")
 
+                elif "video_mme" in dataname:
+                    # Multiple-choice: answer is a single letter like "A"
+                    pred_letter = pred.strip().upper()[:1]
+                    score.append(int(pred_letter == normalize_answer(ref).upper()[:1]))
+                    print("video_mme_score..", end="\r")
+
                 elif "qa_eng" in dataname:
                     score.append(max(f1_score(pred, ref), include_score(pred, ref)))
                     print("f1_score..", end="\r")
