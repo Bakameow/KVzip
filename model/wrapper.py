@@ -632,7 +632,9 @@ class ModelKVzip():
             # VLM 时传入 grid_thw，用于 vision chunk 的 patch 行级二次分块
             grid_thw = None
             if vlm_inputs:
-                grid_thw = vlm_inputs.get("image_grid_thw") or vlm_inputs.get("video_grid_thw")
+                grid_thw = vlm_inputs.get("image_grid_thw")
+                if grid_thw is None:
+                    grid_thw = vlm_inputs.get("video_grid_thw")
             self.scoring(kv, ctx_ids, load_score=load_score, image_grid_thw=grid_thw)
 
         return kv

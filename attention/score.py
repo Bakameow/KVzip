@@ -26,8 +26,8 @@ class KVScore():
         # Stores ranges of multimodal tokens (e.g., image tokens) that should not be scored/pruned
         # Format: List[Tuple[int, int]] where each tuple is (start_pos, end_pos) relative to context
         self.multimodal_ranges: List[Tuple[int, int]] = []
-        # Flag to enable/disable multimodal scoring (for future extension)
-        self.enable_multimodal_scoring: bool = False
+        # Flag to enable/disable multimodal scoring
+        self.enable_multimodal_scoring: bool = True
 
     def set_multimodal_ranges(self, ranges: List[Tuple[int, int]]):
         """Set the ranges of multimodal tokens in the context.

@@ -128,9 +128,9 @@ def _make_cell(text, style, cell_size):
 KEYS = [
     ("plain",       "3-digit-number",          "What is the 3-digit number shown in the image?", 3, 0),
     ("colored",     "6-digit-number",          "What 6-digit number appears in the image?", 6, 0),
-    ("rotated",     "rotated-35-degree",       "What number is shown rotated by approximately 35 degrees?", 6, 35),
-    ("mirrored",    "horizontally-flipped",    "What number appears horizontally flipped in the image?", 5, 0),
-    ("perspective", "perspective-transformed", "What number is displayed with perspective transformation?", 7, 0),
+    # ("rotated",     "rotated-35-degree",       "What number is shown rotated by approximately 35 degrees?", 6, 35),
+    # ("mirrored",    "horizontally-flipped",    "What number appears horizontally flipped in the image?", 5, 0),
+    # ("perspective", "perspective-transformed", "What number is displayed with perspective transformation?", 7, 0),
     # 新增问题：关于图像内容的问题
     ("plain",       "bowls-count",             "How many bowls are there in the image?", 0, 0),
     ("plain",       "hotpot-flavor",           "What flavor is the hotpot in the image?", 0, 0),
@@ -178,6 +178,60 @@ def create_composite_image(secrets: list[str], cell_size: int = 400) -> Image.Im
     return canvas
 
 
+def _draw_text_on_background(background: Image.Image, secret: str, x: int, y: int,
+                              font, text_color, rotation: int = 0,
+                              flip_horizontal: bool = False,
+                              perspective_skew: float = 0.0):
+    """在背景图上叠加文字，使用透明画布避免遮挡背景内容。
+
+    文字带描边以在复杂背景上保持可读性。
+    """
+    # 测量文字尺寸
+    tmp_draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    bbox = tmp_draw.textbbox((0, 0), secret, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    pad = max(8, text_h // 4)
+
+    canvas_w = text_w + pad * 2
+    canvas_h = text_h + pad * 2
+
+    # 透明画布
+    canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    # 描边（黑色轮廓，增强可读性）
+    outline_color = (0, 0, 0, 220)
+    for dx, dy in [(-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)]:
+        draw.text((pad + dx, pad + dy), secret, font=font, fill=outline_color)
+    draw.text((pad, pad), secret, font=font, fill=(*text_color, 255))
+
+    # 变换
+    if flip_horizontal:
+        canvas = canvas.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    if perspective_skew > 0:
+        w, h = canvas.size
+        skew = int(w * perspective_skew)
+        coeffs = _find_perspective_coeffs(
+            [(0, 0), (w, 0), (w, h), (0, h)],
+            [(skew, 0), (w - skew, 0), (w, h), (0, h)]
+        )
+        canvas = canvas.transform((w, h), Image.Transform.PERSPECTIVE, coeffs,
+                                   Image.Resampling.BICUBIC)
+
+    if rotation != 0:
+        canvas = canvas.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=True)
+
+    # 粘贴，用 alpha 通道作 mask
+    paste_x = x - canvas.width // 2
+    paste_y = y - canvas.height // 2
+    # 确保不超出边界
+    paste_x = max(0, min(paste_x, background.width - canvas.width))
+    paste_y = max(0, min(paste_y, background.height - canvas.height))
+    background.paste(canvas, (paste_x, paste_y), canvas)
+
+
 def create_hotpot_composite_image(secrets: list[str], background_path: str = "hotpot.jpg") -> Image.Image:
     """使用 hotpot.jpg 作为背景，在不同位置放置不同格式的 key 数字
 
@@ -206,106 +260,34 @@ def create_hotpot_composite_image(secrets: list[str], background_path: str = "ho
         (0.50, 0.30),   # 上中
     ]
 
-    # 创建绘图对象
-    draw = ImageDraw.Draw(background)
-    font_size = min(width, height) // 10
+    font_size = min(width, height) // 12
     font = _get_font(font_size)
 
     # 在指定位置绘制不同格式的数字（仅前5个）
     for idx in range(min(5, len(KEYS))):
-        if secrets[idx]:
-            style, label, question, num_digits, rotation_angle = KEYS[idx]
-            secret = secrets[idx]
-            x_ratio, y_ratio = positions[idx]
-            x = int(width * x_ratio)
-            y = int(height * y_ratio)
+        if not secrets[idx]:
+            continue
+        style, _, _, _, rotation_angle = KEYS[idx]
+        secret = secrets[idx]
+        x_ratio, y_ratio = positions[idx]
+        x = int(width * x_ratio)
+        y = int(height * y_ratio)
 
-            # 根据样式设置颜色和变换
-            if style == "plain":
-                text_color = (50, 50, 50)  # 深灰文字，无特殊变换
-                # 直接绘制
-                bbox = draw.textbbox((0, 0), secret, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                text_x = x - text_w // 2
-                text_y = y - text_h // 2
-                draw.text((text_x, text_y), secret, fill=text_color, font=font)
-
-            elif style == "colored":
-                # 根据数字生成随机颜色
-                rng = random.Random(sum(ord(c) for c in secret) + 1)
-                text_color = (rng.randint(30, 200), rng.randint(30, 200), rng.randint(30, 200))
-                # 直接绘制彩色数字
-                bbox = draw.textbbox((0, 0), secret, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                text_x = x - text_w // 2
-                text_y = y - text_h // 2
-                draw.text((text_x, text_y), secret, fill=text_color, font=font)
-
-            elif style == "rotated":
-                # 旋转数字
-                text_color = (20, 20, 180)  # 蓝色文字
-                # 在大画布上绘制后旋转裁剪
-                canvas_size = max(font_size * 4, int(font_size * len(secret) * 1.5))
-                canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
-                canvas_draw = ImageDraw.Draw(canvas)
-                font_big = _get_font(font_size)
-                bbox = canvas_draw.textbbox((0, 0), secret, font=font_big)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                canvas_draw.text(
-                    (canvas_size // 2 - text_w // 2, canvas_size // 2 - text_h // 2),
-                    secret, fill=text_color, font=font_big
-                )
-                # 旋转
-                rotated_canvas = canvas.rotate(rotation_angle, resample=Image.Resampling.BICUBIC, expand=True)
-                # 粘贴到背景，中心对齐
-                paste_x = x - rotated_canvas.width // 2
-                paste_y = y - rotated_canvas.height // 2
-                background.paste(rotated_canvas, (paste_x, paste_y), rotated_canvas)
-
-            elif style == "mirrored":
-                # 镜像翻转（水平）
-                text_color = (150, 0, 0)  # 红色文字
-                # 创建临时图像
-                temp_size = int(font_size * len(secret) * 1.2)
-                temp = Image.new("RGB", (temp_size, font_size * 2), (0, 0, 0))
-                temp_draw = ImageDraw.Draw(temp)
-                bbox = temp_draw.textbbox((0, 0), secret, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                temp_draw.text((temp_size // 2 - text_w // 2, font_size - text_h // 2), secret, fill=text_color, font=font)
-                # 水平翻转
-                temp = temp.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-                # 粘贴到背景
-                paste_x = x - temp.width // 2
-                paste_y = y - temp.height // 2
-                background.paste(temp, (paste_x, paste_y))
-
-            elif style == "perspective":
-                # 透视变换
-                text_color = (0, 80, 0)  # 绿色文字
-                # 创建临时图像
-                temp_size = int(font_size * len(secret) * 1.5)
-                temp = Image.new("RGB", (temp_size, temp_size), (0, 0, 0))
-                temp_draw = ImageDraw.Draw(temp)
-                bbox = temp_draw.textbbox((0, 0), secret, font=font)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                temp_draw.text((temp_size // 2 - text_w // 2, temp_size // 2 - text_h // 2), secret, fill=text_color, font=font)
-                # 应用透视变换
-                w, h = temp_size, temp_size
-                skew = w // 5
-                coeffs = _find_perspective_coeffs(
-                    [(0, 0), (w, 0), (w, h), (0, h)],  # 原始四个角
-                    [(skew, 0), (w - skew, 0), (w, h), (0, h)]  # 变换后的四个角（上边倾斜）
-                )
-                temp = temp.transform((w, h), Image.Transform.PERSPECTIVE, coeffs, Image.Resampling.BICUBIC)
-                # 粘贴到背景
-                paste_x = x - temp.width // 2
-                paste_y = y - temp.height // 2
-                background.paste(temp, (paste_x, paste_y))
+        if style == "plain":
+            _draw_text_on_background(background, secret, x, y, font, (255, 240, 50))
+        elif style == "colored":
+            rng = random.Random(sum(ord(c) for c in secret) + 1)
+            color = (rng.randint(100, 255), rng.randint(100, 255), rng.randint(100, 255))
+            _draw_text_on_background(background, secret, x, y, font, color)
+        elif style == "rotated":
+            _draw_text_on_background(background, secret, x, y, font, (80, 160, 255),
+                                     rotation=rotation_angle)
+        elif style == "mirrored":
+            _draw_text_on_background(background, secret, x, y, font, (255, 100, 100),
+                                     flip_horizontal=True)
+        elif style == "perspective":
+            _draw_text_on_background(background, secret, x, y, font, (100, 255, 120),
+                                     perspective_skew=0.2)
 
     return background
 
@@ -382,16 +364,13 @@ def run_image_needle_experiment(
     # 为每个 key 分配不同位数的秘密数字（仅前5个需要数字）
     rng = random.Random(42)
     secrets = []
-    for idx, (style, label, question, num_digits, rotation_angle) in enumerate(KEYS):
-        if idx < 5 and num_digits > 0:
+    for idx, (_, label, question, num_digits, _rotation) in enumerate(KEYS):
+        if num_digits > 0:
             # 根据位数生成随机数字
             min_val = 10 ** (num_digits - 1)
             max_val = 10 ** num_digits - 1
             secret = str(rng.randint(min_val, max_val))
             secrets.append(secret)
-        elif idx < 5:
-            # 如果没有指定位数，使用默认6位
-            secrets.append(str(rng.randint(100000, 999999)))
         else:
             # 后3个是关于图像内容的问题，不需要数字
             secrets.append("")
@@ -405,7 +384,7 @@ def run_image_needle_experiment(
     }
 
     print("Secret numbers per key:")
-    for idx, (style, label, question, num_digits, rotation_angle) in enumerate(KEYS):
+    for idx, (_, label, question, num_digits, rotation_angle) in enumerate(KEYS):
         if secrets[idx]:
             print(f"  {label:30s}: {secrets[idx]} ({num_digits} digits, rotation: {rotation_angle}°)")
         else:
@@ -477,14 +456,14 @@ def run_image_needle_experiment(
     # 对每个 key 分别提问，复用同一份 KV cache
     print(f"\n{'='*70}")
     results = {}
-    for idx, ((style, label, question), secret) in enumerate(zip(KEYS, secrets)):
+    for idx, ((_, label, question, num_digits, rotation_angle), secret) in enumerate(zip(KEYS, secrets)):
         print(f"\n[{label}]")
         print(f"  Q: {question}")
         query_ids = model.apply_template(question)
         output = model.generate(query_ids, kv=kv, update_cache=False)
 
         # 对于数字类问题，检查数字是否在答案中
-        if idx < 5:
+        if num_digits > 0:
             success = secret in output
             gt = secret
         else:
