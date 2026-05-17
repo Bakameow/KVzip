@@ -30,12 +30,12 @@ if __name__ == "__main__":
     for data_idx in range(args.idx, max_idx):
         kv = dataset.prefill_context(data_idx, load_score=args.level == "head")
         inputs, info = dataset.generate_answer(data_idx, kv)
-        eval = Evaluator(model, inputs, info)
+        evaluator = Evaluator(model, inputs, info)
 
         outputs = defaultdict(list)
         for ratio in set_ratios(args.model):
             thres, ratio_true = kv.prune(ratio, args.level)
-            results = eval(kv, generate=True)  # generation
+            results = evaluator(kv, generate=True)  # generation
 
             for fmt, v in results.items():
                 outputs[fmt].append([[ratio, round(ratio_true, 4), round(thres, 4)], v])
@@ -43,5 +43,5 @@ if __name__ == "__main__":
         save_result(args, args.data, outputs, data_idx)
 
         tt(f"{args.data}-{data_idx}")
-        del kv, inputs, info, eval
+        del kv, inputs, info, evaluator
     logger.info("Finished.")

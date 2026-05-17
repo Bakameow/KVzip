@@ -83,6 +83,11 @@ def _build_video_vlm_inputs(data, model: ModelKVzip):
 
     Returns (ctx_ids, vlm_inputs) where vlm_inputs may be None for subtitle-only mode.
     Downloads the video via yt-dlp if not present locally.
+
+    The returned ctx_ids contains ONLY the user message content (video tokens + text),
+    WITHOUT the chat template wrappers (<|im_start|>user\\n and <|im_end|>).
+    This allows prefill() to prepend its own sys_prompt_ids and build a single
+    coherent user turn: system + user(instruction + video + text).
     """
     if not model.is_vlm:
         return None, None
@@ -92,6 +97,7 @@ def _build_video_vlm_inputs(data, model: ModelKVzip):
         return None, None
 
     import av
+    import torch
 
     processor = model.processor
     max_frames = 32
@@ -119,9 +125,35 @@ def _build_video_vlm_inputs(data, model: ModelKVzip):
     inputs = processor(text=[text], videos=[frames], return_tensors="pt")
 
     full_ids = inputs["input_ids"].cuda()
-    user_start_token = model.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)[-1]
-    positions = (full_ids[0] == user_start_token).nonzero(as_tuple=True)[0]
-    ctx_ids = full_ids[:, positions[0].item():]
+
+    # Extract user content between <|im_start|>user\\n and the trailing <|im_end|>
+    # Processor output format:
+    #   <|im_start|>system\\n...<|im_end|>\\n<|im_start|>user\\n[CONTENT]<|im_end|>
+    # We need only the [CONTENT] part so that prefill can prepend its own
+    # sys_prompt_ids and form a single coherent user turn.
+    user_marker_ids = model.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+    im_end_ids = model.tokenizer.encode("<|im_end|>", add_special_tokens=False)
+
+    # Find <|im_start|>user\\n position
+    user_content_start = -1
+    for i in range(full_ids.shape[1] - len(user_marker_ids) + 1):
+        if torch.equal(full_ids[0, i:i + len(user_marker_ids)],
+                       torch.tensor(user_marker_ids, device=full_ids.device)):
+            user_content_start = i + len(user_marker_ids)
+            break
+
+    if user_content_start < 0:
+        print("[video_mme] Failed to locate user marker in processor output")
+        return None, None
+
+    # Find trailing <|im_end|> (search from end)
+    user_content_end = full_ids.shape[1]
+    for i in range(full_ids.shape[1] - 1, -1, -1):
+        if full_ids[0, i].item() in im_end_ids:
+            user_content_end = i
+            break
+
+    ctx_ids = full_ids[:, user_content_start:user_content_end]
 
     vlm_inputs = {
         "pixel_values_videos": inputs["pixel_values_videos"].cuda(),

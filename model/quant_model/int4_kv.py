@@ -15,7 +15,6 @@ class QuantizedCache:
         self.head_dim = head_dim
         self.device = device
         self.group_size = group_size
-        self.device = device
 
         self.num_groups = head_dim // group_size
         quantized_dim = head_dim // 2
@@ -282,6 +281,7 @@ class OptimINT4KVCache(StaticINT4KVCache, RetainCache):
         prefilling_chunk_size=140000,
     ):
         StaticINT4KVCache.__init__(self, model, batch_size, max_size, prefilling_chunk_size)
+        self._seen_tokens = 0  # required by get_seq_length (inherited from DynamicCache via RetainCache)
         self.device = next(model.parameters()).device
         self.dtype = next(model.parameters()).dtype
         self.n_layers = model.config.num_hidden_layers

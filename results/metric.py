@@ -209,9 +209,26 @@ def evaluate_answer(preds, refs, dataname, format, similarity=False, subtask=Non
                     print("rouge_score..", end="\r")
 
                 elif "video_mme" in dataname:
-                    # Multiple-choice: answer is a single letter like "A"
-                    pred_letter = pred.strip().upper()[:1]
-                    score.append(int(pred_letter == normalize_answer(ref).upper()[:1]))
+                    # Multiple-choice: extract A-D letter from various formats:
+                    #   "A", "(A) xxx", "A. xxx", "A: xxx", "Answer: A"
+                    pred = pred.strip().upper()
+                    pred_letter = ''
+                    # Try explicit answer patterns first
+                    m = re.search(r'ANSWER\s*:?\s*\(?([A-D])\)?', pred)
+                    if m:
+                        pred_letter = m.group(1)
+                    elif pred.startswith('(') and len(pred) > 1 and pred[1] in 'ABCD':
+                        pred_letter = pred[1]
+                    elif pred and pred[0] in 'ABCD':
+                        pred_letter = pred[0]
+                    else:
+                        # Last resort: find any A-D letter
+                        m = re.search(r'[A-D]', pred)
+                        pred_letter = m.group(0) if m else ''
+                    # Ref is always A/B/C/D for Video-MME, skip normalize_answer
+                    # because remove_articles would strip the letter "A"
+                    ref_letter = ref.strip().upper()[:1]
+                    score.append(int(pred_letter == ref_letter))
                     print("video_mme_score..", end="\r")
 
                 elif "qa_eng" in dataname:

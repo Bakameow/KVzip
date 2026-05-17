@@ -49,7 +49,8 @@ def vlm_chunk_fn(
 
     if not multimodal_ranges:
         # 无多模态 token，使用普通分块
-        return chunk_fn(ctx_ids, chunk_size), [False] * len(chunk_fn(ctx_ids, chunk_size))
+        chunks = chunk_fn(ctx_ids, chunk_size)
+        return chunks, [False] * len(chunks)
 
     # 构建分块边界点：包含 chunk 边界和多模态区域边界
     boundaries = set()
@@ -322,6 +323,9 @@ class ModelKVzip():
                         ranges.append((start_pos, j + 1))  # Include vision_end
                         i = j + 1
                         break
+                else:
+                    # vision_end not found — advance past the unmatched start
+                    i += 1
                 continue
 
             # Check for continuous image_pad tokens (alternative format)
@@ -970,20 +974,35 @@ class ModelKVzip():
             kv.backup_sliding_cache()
 
         # 准备输入
-        input_ids = query
+        raw_query = query  # 保存原始查询，用于多轮对话时更新 prefill_ids
         if type(query) == str:
-            input_ids = self.encode(query)
+            raw_query = self.encode(query)
 
         # HuggingFace 的 model.generate 需要完整的 input_ids（包含已 cache 的部分）
         # 内部会根据 kv.get_seq_length() 自动切片，只处理新 tokens
         if kv.prefill_ids is not None:
-            input_ids = torch.cat([kv.prefill_ids, input_ids], dim=1)
+            input_ids = torch.cat([kv.prefill_ids, raw_query], dim=1)
+        else:
+            input_ids = raw_query
 
         # 执行自回归生成
         output = self.model.generate(input_ids, past_key_values=kv, **self.gen_kwargs)
 
-        # 解析生成的回答（去掉输入部分和最后的 EOS token）
-        a_ids = output[:, input_ids.shape[1]:-1]
+        # 解析生成的回答（去掉输入部分）
+        generated = output[:, input_ids.shape[1]:]
+        # 如果最后一个 token 是 EOS，则去掉它
+        eos_id = self.gen_kwargs.get("eos_token_id")
+        if eos_id is not None:
+            if isinstance(eos_id, int):
+                eos_ids = {eos_id}
+            else:
+                eos_ids = set(eos_id)
+            if generated.numel() > 0 and generated[0, -1].item() in eos_ids:
+                a_ids = generated[:, :-1]
+            else:
+                a_ids = generated
+        else:
+            a_ids = generated[:, :-1]  # fallback: assume last token is EOS
         a = self.decode(a_ids)
 
         # Cache 状态管理
@@ -994,11 +1013,11 @@ class ModelKVzip():
         else:
             # 保留本次 query 和 answer 的 KV，更新 prefill_ids
             # 支持多轮对话
-            # 注意：此时 kv.prefill_ids 需要更新为包含 query 和 answer
+            # 使用 raw_query（不含 prefill_ids）避免 prefill 内容重复
             if kv.prefill_ids is not None:
-                kv.prefill_ids = torch.cat([kv.prefill_ids, input_ids, a_ids], dim=1)
+                kv.prefill_ids = torch.cat([kv.prefill_ids, raw_query, a_ids], dim=1)
             else:
-                kv.prefill_ids = torch.cat([input_ids, a_ids], dim=1)
+                kv.prefill_ids = torch.cat([raw_query, a_ids], dim=1)
 
         return a
 

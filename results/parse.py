@@ -3,7 +3,6 @@ import torch
 from collections import defaultdict
 from datasets import load_dataset
 from results.metric import evaluate_answer
-from eval import set_ratios
 
 
 def parse_answer(name):

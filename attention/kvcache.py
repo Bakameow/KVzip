@@ -116,8 +116,10 @@ class EvictCache(DynamicCache, KVScore):
     def _mem(self):
         """ Returns the memory usage of the cache in GB.
         """
+        if len(self.key_cache) == 0:
+            return 0.0
         mem = 0
-        for i in range(self.n_layers):
+        for i in range(min(self.n_layers, len(self.key_cache))):
             mem += self.key_cache[i].numel() * self.key_cache[i].element_size()
         mem *= 2  # key + value
         return round(mem / 10**9, 1)
@@ -280,6 +282,8 @@ class RetainCache(DynamicCache, KVScore):
     def _mem(self):
         """ Returns the memory usage of the cache in GB.
         """
+        if len(self.key_cache) == 0:
+            return 0.0
         mem = self.n_layers * self.key_cache[0].numel() * self.key_cache[0].element_size()
         mem *= 2  # key + value
         return round(mem / 10**9, 1)
@@ -502,7 +506,7 @@ class RetainHybridCache(HybridCache, HybridKVScore):
     # sliding window layer, thus it does not return the correct sequence length seen so far.
     # (when not given cache_position)
     def get_seq_length(self, layer_idx: Optional[int] = 0):
-        return torch.tensor(self._seen_tokens, device=self.device)
+        return self._seen_tokens
 
     def backup_sliding_cache(self):
         assert self.backup_sliding_keys is None and self.backup_sliding_values is None
